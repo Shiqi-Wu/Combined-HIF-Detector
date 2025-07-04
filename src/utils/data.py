@@ -18,8 +18,8 @@ def sliding_window_split(sequence, window_size=30, stride=10):
         slices.append(sequence[start:end])
     return slices
 
-def load_dataset_from_files(config):
-    data_dir = config['data_dir']
+def load_dataset_from_files(data_dir, config):
+    # data_dir = config['data_dir']
     x_trajectories = []
     u_trajetories = []
     p_lables = []
@@ -50,6 +50,23 @@ def load_dataset_from_files(config):
     return x_trajectories, u_trajetories, p_lables
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, x_trajectories, u_trajetories, p_lables, )
+    def __init__(self, x_trajectories, u_trajetories, p_lables, window_size, stride):
+        self.x_samples = []
+        self.u_samples = []
+        self.p_labels = []
+        for x_traj, u_traj, p_label in zip(x_trajectories, u_trajetories, p_lables):
+            x_slices = sliding_window_split(x_traj, window_size, stride)
+            u_slices = sliding_window_split(u_traj, window_size, stride)
+            self.x_samples.extend(x_slices)
+            self.u_samples.extend(u_slices)
+            self.p_labels.extend([p_label] * len(x_slices))
 
+    def __len__(self):
+        return len(self.x_samples)
+    
+    def __getitem__(self, idx):
+        x_sample = self.x_samples[idx]
+        u_sample = self.u_samples[idx]
+        p_label = self.p_labels[idx]
+        return x_sample, u_sample, p_label
 
