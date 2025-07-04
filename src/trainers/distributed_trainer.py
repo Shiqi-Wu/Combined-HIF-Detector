@@ -1,19 +1,20 @@
+
 """
 Multi-node distributed training framework for LSTM classifier using HuggingFace Accelerate
 
 Features:
 - HuggingFace Accelerate for simplified distributed training
 - Multi-node and multi-GPU support
-- Automatic mixed precision training
 - Gradient accumulation
 - Fault tolerance and resume capability
 - Comprehensive logging and monitoring
 """
 
 import torch
+torch.set_default_dtype(torch.float64)
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import os
 import sys
 import time
@@ -38,7 +39,7 @@ except ImportError:
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.fault_lstm_classifier import LSTMClassifier
-from utils.dataloader import load_full_dataset
+from utils.dataloader import load_full_dataset, create_kfold_dataloaders, create_preprocessed_kfold_dataloaders, ScaledDataset
 
 # Handle wandb import gracefully
 WANDB_AVAILABLE = False
@@ -56,7 +57,7 @@ class AcceleratedLSTMTrainer:
     Supports multi-node, multi-GPU training with automatic mixed precision
     """
     
-    def __init__(self, model_config, train_config):
+    def __init__(self, model_config, train_config, accelerator=None):
         """
         Initialize the accelerated trainer
         
@@ -71,12 +72,15 @@ class AcceleratedLSTMTrainer:
         self.train_config = train_config
         
         # Initialize accelerator
-        self.accelerator = Accelerator(
-            gradient_accumulation_steps=train_config.get('gradient_accumulation_steps', 1),
-            mixed_precision=train_config.get('mixed_precision', 'fp16'),
-            log_with=["wandb"] if train_config.get('use_wandb', False) and WANDB_AVAILABLE else None,
-            project_dir=train_config.get('results_dir', './results'),
-        )
+        if accelerator is not None:
+            self.accelerator = accelerator
+        else:
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=train_config.get('gradient_accumulation_steps', 1),
+                mixed_precision='no',
+                log_with=["wandb"] if train_config.get('use_wandb', False) and WANDB_AVAILABLE else None,
+                project_dir=train_config.get('results_dir', './results'),
+            )
         
         # Set random seed for reproducibility
         if train_config.get('seed'):
@@ -94,7 +98,7 @@ class AcceleratedLSTMTrainer:
             self.use_wandb = False
         
         # Create model
-        self.model = LSTMClassifier(**model_config)
+        self.model = LSTMClassifier(**model_config).to(torch.float64)
         
         # Setup optimizer and scheduler
         self.optimizer = optim.AdamW(
@@ -121,16 +125,14 @@ class AcceleratedLSTMTrainer:
             'training_time': []
         }
     
-    def create_scheduler(self, num_training_steps):
+    def create_scheduler(self, optimizer):
         """Create learning rate scheduler"""
-        from torch.optim.lr_scheduler import OneCycleLR
-        
-        return OneCycleLR(
-            self.optimizer,
-            max_lr=self.train_config['learning_rate'],
-            total_steps=num_training_steps,
-            pct_start=0.3,
-            anneal_strategy='cos'
+        return optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            patience=10, 
+            factor=0.5,
+            verbose=self.accelerator.is_main_process
         )
     
     def prepare_data_loaders(self, train_dataset, val_dataset):
@@ -170,6 +172,9 @@ class AcceleratedLSTMTrainer:
         
         for batch_idx, batch in enumerate(progress_bar):
             x_batch, u_batch, p_batch = batch
+            x_batch = x_batch.to(torch.float64)
+            u_batch = u_batch.to(torch.float64)
+
             
             # Convert one-hot to class indices if needed
             if p_batch.dim() > 1 and p_batch.size(1) > 1:
@@ -178,6 +183,9 @@ class AcceleratedLSTMTrainer:
                 p_indices = p_batch.long()
             
             with self.accelerator.accumulate(self.model):
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
                 # Forward pass
                 outputs = self.model(x_batch)
                 loss = self.criterion(outputs, p_indices)
@@ -185,8 +193,8 @@ class AcceleratedLSTMTrainer:
                 # Backward pass
                 self.accelerator.backward(loss)
                 
-                # Gradient clipping
-                if self.train_config.get('grad_clip'):
+                # Gradient clipping (only if not using gradient accumulation or on the last accumulation step)
+                if self.train_config.get('grad_clip') and self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(
                         self.model.parameters(), 
                         self.train_config['grad_clip']
@@ -194,8 +202,10 @@ class AcceleratedLSTMTrainer:
                 
                 # Optimizer step
                 self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                
+                # Learning rate scheduler step (only when gradients are synchronized)
+                # if self.accelerator.sync_gradients:
+                    # self.scheduler.step()
             
             # Statistics
             total_loss += loss.item()
@@ -206,10 +216,11 @@ class AcceleratedLSTMTrainer:
             # Update progress bar
             if self.accelerator.is_main_process and hasattr(progress_bar, 'set_postfix'):
                 current_acc = total_correct / total_samples
+                current_lr = self.optimizer.param_groups[0]['lr']
                 progress_bar.set_postfix({
                     'Loss': f'{total_loss/(batch_idx+1):.4f}',
                     'Acc': f'{current_acc:.4f}',
-                    'LR': f'{self.scheduler.get_last_lr()[0]:.6f}'
+                    'LR': f'{current_lr:.6f}'
                 })
         
         # Calculate metrics
@@ -233,6 +244,9 @@ class AcceleratedLSTMTrainer:
         with torch.no_grad():
             for batch in val_loader:
                 x_batch, u_batch, p_batch = batch
+                x_batch = x_batch.to(torch.float64)
+                u_batch = u_batch.to(torch.float64)
+
                 
                 # Convert one-hot to class indices if needed
                 if p_batch.dim() > 1 and p_batch.size(1) > 1:
@@ -267,7 +281,7 @@ class AcceleratedLSTMTrainer:
             'train_history': self.train_history,
             'model_config': self.model_config,
             'train_config': self.train_config,
-            'accelerator_state': self.accelerator.get_state_dict()
+            'accelerator_state': self.accelerator.get_state_dict(self.model)
         }
         
         # Save latest checkpoint
@@ -322,7 +336,7 @@ class AcceleratedLSTMTrainer:
         num_training_steps = len(train_loader) * num_epochs // gradient_accumulation_steps
         
         # Create scheduler
-        self.scheduler = self.create_scheduler(num_training_steps)
+        self.scheduler = self.create_scheduler(self.optimizer)
         
         # Prepare everything with accelerator
         self.model, self.optimizer, train_loader, val_loader, self.scheduler = self.accelerator.prepare(
@@ -358,6 +372,7 @@ class AcceleratedLSTMTrainer:
             
             # Validation
             val_loss, val_acc = self.validate_epoch(val_loader)
+            self.scheduler.step(val_loss)
             
             # Record metrics
             current_lr = self.scheduler.get_last_lr()[0]
@@ -436,47 +451,61 @@ class AcceleratedLSTMTrainer:
 
 
 def main():
-    """Main training function using Accelerate framework"""
-    parser = argparse.ArgumentParser(description='Accelerated LSTM Training')
-    
+    parser = argparse.ArgumentParser(description='K-Fold Accelerated LSTM Training')
+
     # Data parameters
-    parser.add_argument('--data_dir', type=str, default='data', help='Data directory')
+    parser.add_argument('--data_dir', type=str, required=True, help='Data directory')
     parser.add_argument('--window_size', type=int, default=30, help='Window size')
-    parser.add_argument('--sample_step', type=int, default=1, help='Sample step')
-    
+    parser.add_argument('--sample_step', type=int, default=1, help='Sampling step')
+    parser.add_argument('--pca_dim', type=int, default=2, help='PCA dimension')
+
     # Model parameters
     parser.add_argument('--hidden_size', type=int, default=128, help='Hidden size')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of layers')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
-    parser.add_argument('--bidirectional', action='store_true', default=True, help='Bidirectional LSTM')
-    
+    parser.add_argument('--bidirectional', action='store_true', default=True, help='Use bidirectional LSTM')
+
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size per device')
-    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--mixed_precision', type=str, default='fp16', choices=['no', 'fp16', 'bf16'], help='Mixed precision training')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    # Logging parameters
-    parser.add_argument('--results_dir', type=str, default='./results_accelerated', help='Results directory')
-    parser.add_argument('--use_wandb', action='store_true', help='Use wandb logging')
-    parser.add_argument('--wandb_project', type=str, default='accelerated-lstm-training', help='Wandb project')
-    
+
+    # Logging
+    parser.add_argument('--results_dir', type=str, default='./results_kfold', help='Root directory to store fold results')
+    parser.add_argument('--use_wandb', action='store_true', help='Use WandB logging')
+    parser.add_argument('--wandb_project', type=str, default='kfold-lstm-training', help='WandB project name')
+
+    # K-Fold
+    parser.add_argument('--k_folds', type=int, default=5, help='Number of folds')
+
     args = parser.parse_args()
-    
-    # Configuration dictionaries
-    model_config = {
-        'hidden_size': args.hidden_size,
-        'num_layers': args.num_layers,
-        'num_classes': 6,  # Classes 2-7 (6 classes total)
-        'dropout': args.dropout,
-        'bidirectional': args.bidirectional
+
+    # Step 1: Load full dataset
+    data_config = {
+        'window_size': args.window_size,
+        'sample_step': args.sample_step,
+        'batch_size': args.batch_size
     }
-    
+
+    print("\n===== Loading Dataset =====")
+    dataset, file_labels = load_full_dataset(args.data_dir, data_config)
+
+    # Step 2: Create K-Fold Dataloaders with shared preprocessing
+    print("\n===== Creating K-Fold Splits with Shared Preprocessing =====")
+    folds, preprocessing_params = create_preprocessed_kfold_dataloaders(
+        dataset,
+        file_labels,
+        config=data_config,
+        n_splits=args.k_folds,
+        random_state=args.seed,
+        pca_dim=args.pca_dim
+    )
+
     train_config = {
         'batch_size': args.batch_size,
         'num_epochs': args.num_epochs,
@@ -485,55 +514,47 @@ def main():
         'patience': args.patience,
         'grad_clip': args.grad_clip,
         'gradient_accumulation_steps': args.gradient_accumulation_steps,
-        'mixed_precision': args.mixed_precision,
         'seed': args.seed,
-        'results_dir': args.results_dir,
+        'results_dir': fold_result_dir,
         'use_wandb': args.use_wandb,
         'wandb_project': args.wandb_project
     }
-    
-    data_config = {
-        'data_dir': args.data_dir,
-        'window_size': args.window_size,
-        'sample_step': args.sample_step
-    }
-    
-    # Load dataset
-    print("Loading dataset...")
-    dataset, file_labels = load_full_dataset(data_config['data_dir'], data_config)
-    
-    # Split into train and validation sets
-    train_indices, val_indices = train_test_split(
-        range(len(dataset)), 
-        test_size=0.2, 
-        random_state=args.seed,
-        stratify=[file_labels[i] for i in range(len(dataset))]
-    )
-    
-    # Create subset datasets
-    from torch.utils.data import Subset
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-    
-    # Get input size from a sample
-    sample_batch = dataset[0]
-    input_size = sample_batch[0].shape[1]  # (seq_len, input_size)
-    model_config['input_size'] = input_size
-    
-    print(f"Input size: {input_size}")
-    print(f"Sequence length: {sample_batch[0].shape[0]}")
-    
-    # Create trainer
-    trainer = AcceleratedLSTMTrainer(model_config, train_config)
-    
-    # Start training
-    print("Starting accelerated training...")
-    best_val_acc = trainer.train(train_dataset, val_dataset)
-    
-    print(f"Training completed! Best validation accuracy: {best_val_acc:.4f}")
 
+    accelerator = Accelerator(
+        gradient_accumulation_steps=train_config.get('gradient_accumulation_steps', 1),
+        mixed_precision='no',
+        log_with=["wandb"] if train_config.get('use_wandb', False) and WANDB_AVAILABLE else None,
+        project_dir=train_config.get('results_dir', './results'),
+    )
+
+    # Step 3: Train across folds
+    fold_accuracies = []
+    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
+        print(f"\n========================\n Fold {fold_idx + 1}/{args.k_folds}\n========================")
+
+        fold_result_dir = os.path.join(args.results_dir, f"fold_{fold_idx + 1}")
+        os.makedirs(fold_result_dir, exist_ok=True)
+
+        model_config = {
+            'input_size': train_loader.dataset[0][0].shape[1],
+            'hidden_size': args.hidden_size,
+            'num_layers': args.num_layers,
+            'num_classes': 6,  # ErrorType: 2~7
+            'dropout': args.dropout,
+            'bidirectional': args.bidirectional
+        }
+        print(model_config)
+
+        trainer = AcceleratedLSTMTrainer(model_config, train_config, accelerator=accelerator)
+        best_val_acc = trainer.train(train_loader.dataset, val_loader.dataset)
+        fold_accuracies.append(best_val_acc)
+
+    # Step 4: Summary
+    print("\n===== K-Fold Summary =====")
+    for i, acc in enumerate(fold_accuracies):
+        print(f"Fold {i + 1}: {acc:.4f}")
+    print(f"Average Accuracy: {np.mean(fold_accuracies):.4f}")
 
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.float64)
     main()

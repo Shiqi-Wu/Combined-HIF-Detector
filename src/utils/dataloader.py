@@ -2,8 +2,10 @@ import numpy as np
 import os
 from sklearn.model_selection import train_test_split, KFold, StratifiedShuffleSplit
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
 from torch.utils.data import Dataset, DataLoader, Subset
 import torch
+import pickle
 
 
 def integer_to_one_hot(integer, min_val, max_val):
@@ -22,7 +24,7 @@ def non_overlapping_window_split(sequence, window_size=30):
             slices.append(sequence[start:end])
     return slices
 
-def load_dataset_from_folder(data_dir, config, test_size=0.2, random_state=42):
+def load_dataset_from_folder(data_dir, config, test_size=0.2, random_state=42, delete_columns=[9, 21, 25, 39, 63]):
     """
     Load dataset from folder and split into training and test sets
     
@@ -54,6 +56,9 @@ def load_dataset_from_folder(data_dir, config, test_size=0.2, random_state=42):
                 # Extract signal data
                 x_data = data_dict['signals'][:, :-6]  # State signals
                 u_data = data_dict['signals'][:, -6:-4]  # Control signals
+                
+                # Apply column deletion
+                x_data = np.delete(x_data, delete_columns, axis=1)
                 
                 # Data sampling
                 x_data = x_data[::config['sample_step'], :]
@@ -144,7 +149,7 @@ class NonOverlappingTrajectoryDataset(Dataset):
         
         return x_sample, u_sample, p_label
 
-def load_full_dataset(data_dir, config):
+def load_full_dataset(data_dir, config, delete_columns=[9, 21, 25, 39, 63]):
     """
     Load complete dataset for k-fold cross validation
     
@@ -176,9 +181,13 @@ def load_full_dataset(data_dir, config):
                 # Extract signal data
                 x_data = data_dict['signals'][:, :-6]  # State signals
                 u_data = data_dict['signals'][:, -6:-4]  # Control signals
+                
+                # Apply column deletion
+                x_data = np.delete(x_data, delete_columns, axis=1)
+                
                 # print(x_data.shape, u_data.shape)
-                x_data = x_data[100:]  # Skip first 1000 samples
-                u_data = u_data[100:]  # Skip first 1000 samples
+                x_data = x_data[100:]  # Skip first 100 samples
+                u_data = u_data[100:]  # Skip first 100 samples
                 
                 # Data sampling
                 x_data = x_data[::config['sample_step'], :]
@@ -311,32 +320,92 @@ def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_st
     return fold_dataloaders
 
 
+def create_preprocessed_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_state=42, pca_dim=2):
+    """
+    Create k-fold cross validation dataloaders with shared preprocessing (scaling + PCA) parameters.
+
+    Args:
+        dataset: Complete dataset
+        file_labels: Labels for stratified splitting
+        config: Configuration dictionary
+        n_splits: Number of folds
+        random_state: Random seed
+        pca_dim: Number of PCA components
+
+    Returns:
+        fold_dataloaders: List of (train_loader, val_loader, test_loader) for each fold
+        preprocessing_params: Shared preprocessing parameters used for all folds
+    """
+    from torch.utils.data import DataLoader
+
+    # First get the basic fold dataloaders
+    fold_dataloaders = create_kfold_dataloaders(dataset, file_labels, config, n_splits, random_state)
+
+    print("Fitting shared preprocessing parameters on full dataset...")
+    scaler_dataset = ScaledDataset(dataset, pca_dim=pca_dim, fit_scalers=True)
+    shared_params = scaler_dataset.get_preprocessing_params()
+
+    preprocessed_fold_dataloaders = []
+
+    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(fold_dataloaders):
+        print(f"Applying shared preprocessing to fold {fold_idx + 1}/{n_splits}")
+
+        train_scaled = ScaledDataset(train_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
+        train_scaled.set_preprocessing_params(shared_params)
+        val_scaled = ScaledDataset(val_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
+        val_scaled.set_preprocessing_params(shared_params)
+        test_scaled = ScaledDataset(test_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
+        test_scaled.set_preprocessing_params(shared_params)
+
+        train_loader_scaled = DataLoader(train_scaled, batch_size=config.get('batch_size', 32), shuffle=True, num_workers=0)
+        val_loader_scaled = DataLoader(val_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
+        test_loader_scaled = DataLoader(test_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
+
+        preprocessed_fold_dataloaders.append((train_loader_scaled, val_loader_scaled, test_loader_scaled))
+
+        print(f"  Fold {fold_idx + 1}: Preprocessing applied successfully")
+
+    return preprocessed_fold_dataloaders, shared_params
+
+
 class ScaledDataset(Dataset):
     """
-    Dataset wrapper that applies scaling to x (state) and u (control) data
+    Dataset wrapper that applies scaling and PCA to x (state) and scaling to u (control) data
+    Following the preprocessing pipeline: x -> scale -> PCA(2D) -> scale, u -> scale
     """
     
-    def __init__(self, base_dataset, scaler_x=None, scaler_u=None, fit_scalers=False):
+    def __init__(self, base_dataset, pca_dim=2, fit_scalers=False):
         """
-        Initialize scaled dataset
+        Initialize scaled dataset with PCA preprocessing
         
         Args:
             base_dataset: Original dataset
-            scaler_x: Scaler for x data (state signals)
-            scaler_u: Scaler for u data (control signals)  
-            fit_scalers: Whether to fit the scalers on this dataset
+            pca_dim: Number of PCA components (default: 2)
+            fit_scalers: Whether to fit the scalers and PCA on this dataset
         """
         self.base_dataset = base_dataset
-        # self.p_labels = base_dataset.p_labels
-        self.scaler_x = scaler_x or StandardScaler()
-        self.scaler_u = scaler_u or StandardScaler()
+        self.pca_dim = pca_dim
+        
+        # Initialize components
+        self.scaler_x1 = StandardScaler()  # First x scaler (before PCA)
+        self.scaler_x2 = StandardScaler()  # Second x scaler (after PCA)
+        self.scaler_u = StandardScaler()   # U scaler
+        self.pca = PCA(n_components=pca_dim)
+        
+        # Statistics storage
+        self.mean_1 = None
+        self.std_1 = None
+        self.mean_2 = None
+        self.std_2 = None
+        self.mean_u = None
+        self.std_u = None
         
         if fit_scalers:
-            self._fit_scalers()
+            self._fit_scalers_and_pca()
     
-    def _fit_scalers(self):
-        """Fit scalers on the entire dataset"""
-        print("Fitting scalers on dataset...")
+    def _fit_scalers_and_pca(self):
+        """Fit scalers and PCA on the entire dataset following the preprocessing pipeline"""
+        print("Fitting scalers and PCA on dataset...")
         
         # Collect all x and u data for fitting
         all_x_data = []
@@ -345,7 +414,7 @@ class ScaledDataset(Dataset):
         for i in range(len(self.base_dataset)):
             x_batch, u_batch, p_batch = self.base_dataset[i]
             
-            # Reshape for scaler (samples, features)
+            # Reshape for processing (samples, features)
             x_reshaped = x_batch.view(-1, x_batch.shape[-1])  # (seq_len, features)
             u_reshaped = u_batch.view(-1, u_batch.shape[-1])  # (seq_len, features)
             
@@ -353,16 +422,53 @@ class ScaledDataset(Dataset):
             all_u_data.append(u_reshaped.numpy())
         
         # Concatenate all data
-        all_x = np.concatenate(all_x_data, axis=0)
-        all_u = np.concatenate(all_u_data, axis=0)
+        x_data = np.concatenate(all_x_data, axis=0)
+        u_data = np.concatenate(all_u_data, axis=0)
         
-        # Fit scalers
-        self.scaler_x.fit(all_x)
-        self.scaler_u.fit(all_u)
+        # Step 1: First scaling for x_data
+        self.mean_1 = np.mean(x_data, axis=0)
+        self.std_1 = np.std(x_data, axis=0)
+        # Avoid division by zero
+        self.std_1 = np.where(self.std_1 == 0, 1, self.std_1)
+        x_data_scaled1 = (x_data - self.mean_1) / self.std_1
         
-        print(f"X data - Mean: {self.scaler_x.mean_[:5]}, Std: {self.scaler_x.scale_[:5]}")
-        print(f"U data - Mean: {self.scaler_u.mean_[:5]}, Std: {self.scaler_u.scale_[:5]}")
-        print("Scalers fitted successfully!")
+        # Step 2: Scaling for u_data
+        self.mean_u = np.mean(u_data, axis=0)
+        self.std_u = np.std(u_data, axis=0)
+        # Avoid division by zero
+        self.std_u = np.where(self.std_u == 0, 1, self.std_u)
+        
+        # Step 3: PCA on scaled x_data
+        self.pca.fit(x_data_scaled1)
+        x_data_pca = self.pca.transform(x_data_scaled1)
+        
+        # Step 4: Second scaling after PCA
+        self.mean_2 = np.mean(x_data_pca, axis=0)
+        self.std_2 = np.std(x_data_pca, axis=0)
+        # Avoid division by zero
+        self.std_2 = np.where(self.std_2 == 0, 1, self.std_2)
+        
+        print(f"X data - Original shape: {x_data.shape}")
+        print(f"X data - After PCA shape: {x_data_pca.shape}")
+        print(f"X data - Mean1: {self.mean_1[:5]}, Std1: {self.std_1[:5]}")
+        print(f"X data - Mean2: {self.mean_2}, Std2: {self.std_2}")
+        print(f"U data - Mean: {self.mean_u}, Std: {self.std_u}")
+        print(f"PCA explained variance ratio: {self.pca.explained_variance_ratio_}")
+        print("Scalers and PCA fitted successfully!")
+        # Save preprocessing parameters to file
+        self.save_preprocessing_params("./results/preprocessing_params_fold.pkl")
+
+    def save_preprocessing_params(self, filepath):
+        """Save preprocessing parameters to a file"""
+        params = self.get_preprocessing_params()
+        with open(filepath, "wb") as f:
+            pickle.dump(params, f)
+
+    def load_preprocessing_params(self, filepath):
+        """Load preprocessing parameters from a file"""
+        with open(filepath, "rb") as f:
+            params = pickle.load(f)
+        self.set_preprocessing_params(params)
     
     def __len__(self):
         return len(self.base_dataset)
@@ -370,90 +476,69 @@ class ScaledDataset(Dataset):
     def __getitem__(self, idx):
         x_batch, u_batch, p_batch = self.base_dataset[idx]
         
-        # Scale x data (state signals)
+        # Process x data: scale -> PCA -> scale
         x_shape = x_batch.shape
         x_reshaped = x_batch.view(-1, x_shape[-1])  # (seq_len, features)
-        x_scaled = self.scaler_x.transform(x_reshaped.numpy())
-        x_scaled = torch.from_numpy(x_scaled).view(x_shape).float()
+        x_numpy = x_reshaped.numpy()
         
-        # Scale u data (control signals)
+        # Step 1: First scaling
+        x_scaled1 = (x_numpy - self.mean_1) / self.std_1
+        
+        # Step 2: PCA transformation
+        x_pca = self.pca.transform(x_scaled1)
+        
+        # Step 3: Second scaling
+        x_final = (x_pca - self.mean_2) / self.std_2
+        
+        # Convert back to tensor with new shape (seq_len, pca_dim)
+        x_processed = torch.from_numpy(x_final).view(x_shape[0], self.pca_dim).float()
+        
+        # Process u data: scale only
         u_shape = u_batch.shape
         u_reshaped = u_batch.view(-1, u_shape[-1])  # (seq_len, features)
-        u_scaled = self.scaler_u.transform(u_reshaped.numpy())
-        u_scaled = torch.from_numpy(u_scaled).view(u_shape).float()
+        u_numpy = u_reshaped.numpy()
+        u_scaled = (u_numpy - self.mean_u) / self.std_u
+        u_processed = torch.from_numpy(u_scaled).view(u_shape).float()
         
-        return x_scaled, u_scaled, p_batch
+        return x_processed, u_processed, p_batch
     
-    def get_scalers(self):
-        """Return the fitted scalers"""
-        return self.scaler_x, self.scaler_u
+    def get_preprocessing_params(self):
+        """Return the preprocessing parameters"""
+        return {
+            'mean_1': self.mean_1,
+            'std_1': self.std_1,
+            'mean_2': self.mean_2,
+            'std_2': self.std_2,
+            'mean_u': self.mean_u,
+            'std_u': self.std_u,
+            'pca_components': self.pca.components_,
+            'pca_explained_variance_ratio': self.pca.explained_variance_ratio_,
+            'pca_explained_variance': self.pca.explained_variance_,
+        }
+    
+    def set_preprocessing_params(self, params):
+        """Set preprocessing parameters from external source"""
+        self.mean_1 = params['mean_1']
+        self.std_1 = params['std_1']
+        self.mean_2 = params['mean_2']
+        self.std_2 = params['std_2']
+        self.mean_u = params['mean_u']
+        self.std_u = params['std_u']
+
+        # Reconstruct PCA model
+        self.pca.components_ = params['pca_components']
+        self.pca.n_components_ = params['pca_components'].shape[0]
+        self.pca.n_features_ = params['pca_components'].shape[1]
+        self.pca.mean_ = np.zeros(self.pca.n_features_)  # safe default
+
+        if 'pca_explained_variance_ratio' in params:
+            self.pca.explained_variance_ratio_ = params['pca_explained_variance_ratio']
+
+        # Add this to fix AttributeError during transform
+        self.pca.explained_variance_ = np.ones(self.pca.n_components_)  # dummy values, needed for transform
+
     
     @property
     def p_labels(self):
         # Delegates to base dataset (assuming it has p_labels)
         return self.base_dataset.p_labels if hasattr(self.base_dataset, "p_labels") else None
-
-
-# # Usage example
-# if __name__ == "__main__":
-#     # Configuration parameters
-#     config = {
-#         'sample_step': 1,      # Sampling step
-#         'window_size': 30,     # Window size
-#         'batch_size': 32       # Batch size
-#     }
-    
-#     # Data folder path
-#     data_dir = "/Users/shiqi/Documents/PhD/Code/Project3-power-grid/Combined-HIF-Detector/data"
-    
-#     try:
-#         # Create training and testing DataLoaders
-#         train_loader, test_loader = load_dataset_from_folder(
-#             data_dir=data_dir,
-#             config=config,
-#             test_size=0.2,  # 20% as test set
-#             random_state=42
-#         )
-        
-#         # Test DataLoaders
-#         print("\n=== Testing DataLoaders ===")
-#         for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader):
-#             print(f"Batch {batch_idx + 1}:")
-#             print(f"  x_batch shape: {x_batch.shape}")
-#             print(f"  u_batch shape: {u_batch.shape}")
-#             print(f"  p_batch shape: {p_batch.shape}")
-            
-#             if batch_idx >= 2:  # Show only first 3 batches
-#                 break
-                
-#         print(f"\nTotal training batches: {len(train_loader)}")
-#         print(f"Total test batches: {len(test_loader)}")
-        
-#         # Load full dataset for k-fold cross validation
-#         complete_dataset, file_labels = load_full_dataset(data_dir=data_dir, config=config)
-        
-#         # Create k-fold dataloaders
-#         n_splits = 5
-#         fold_dataloaders = create_kfold_dataloaders(dataset=complete_dataset, file_labels=file_labels, config=config, n_splits=n_splits)
-        
-#         # Test k-fold dataloaders
-#         print("\n=== Testing k-fold DataLoaders ===")
-#         for fold_idx, (train_loader_fold, val_loader_fold, test_loader) in enumerate(fold_dataloaders):
-#             print(f"Fold {fold_idx + 1}:")
-#             print(f"  Train batches: {len(train_loader_fold)}")
-#             print(f"  Val batches: {len(val_loader_fold)}")
-#             print(f"  Test batches: {len(test_loader)}")
-            
-#             # Test one batch from train and val loaders
-#             for batch_idx, (x_batch, u_batch, p_batch) in enumerate(train_loader_fold):
-#                 print(f"  Train Batch {batch_idx + 1}: x_batch shape: {x_batch.shape}, u_batch shape: {u_batch.shape}, p_batch shape: {p_batch.shape}")
-#                 if batch_idx >= 1:  # Show only first 2 batches
-#                     break
-            
-#             for batch_idx, (x_batch, u_batch, p_batch) in enumerate(val_loader_fold):
-#                 print(f"  Val Batch {batch_idx + 1}: x_batch shape: {x_batch.shape}, u_batch shape: {u_batch.shape}, p_batch shape: {p_batch.shape}")
-#                 if batch_idx >= 1:  # Show only first 2 batches
-#                     break
-    
-#     except Exception as e:
-#         print(f"Error: {e}")

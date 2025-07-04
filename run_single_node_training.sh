@@ -43,34 +43,34 @@ WINDOW_SIZE=30
 
 # Model parameters  
 HIDDEN_SIZE=128
-NUM_LAYERS=2
+NUM_LAYERS=6
 DROPOUT=0.2
 BIDIRECTIONAL=true
 
 # Training parameters optimized for multi-GPU
 if [ "$NUM_GPUS" -gt 1 ]; then
-    BATCH_SIZE=24  # Per-GPU batch size for multi-GPU
+    BATCH_SIZE=4096  # Per-GPU batch size for multi-GPU
     GRADIENT_ACCUMULATION_STEPS=2
 else
-    BATCH_SIZE=64  # Larger batch for single GPU/CPU
+    BATCH_SIZE=4096  # Larger batch for single GPU/CPU
     GRADIENT_ACCUMULATION_STEPS=1
 fi
 
-NUM_EPOCHS=100
+NUM_EPOCHS=1
 LEARNING_RATE=0.001
 WEIGHT_DECAY=1e-4
 PATIENCE=20
 GRAD_CLIP=1.0
-MIXED_PRECISION="fp16"  # Use fp16 for faster training on GPUs
+MIXED_PRECISION="no"
 SEED=42
 
 # Logging parameters
-USE_WANDB=false
+USE_WANDB=true
 WANDB_PROJECT="single-node-lstm"
 EXPERIMENT_NAME="single_node_$(date +%Y%m%d_%H%M%S)"
 
 # Output
-RESULTS_DIR="./results_single_node"
+RESULTS_DIR="./results/results_6layers_lstm"
 SCRIPT_PATH="./src/trainers/distributed_trainer.py"
 
 # ================================
@@ -119,7 +119,6 @@ downcast_bf16: 'no'
 gpu_ids: all
 machine_rank: 0
 main_training_function: main
-mixed_precision: $MIXED_PRECISION
 num_machines: 1
 num_processes: $NUM_GPUS
 rdzv_backend: static
@@ -138,7 +137,6 @@ distributed_type: NO
 downcast_bf16: 'no'
 machine_rank: 0
 main_training_function: main
-mixed_precision: $MIXED_PRECISION
 num_machines: 1
 num_processes: 1
 tpu_env: []
@@ -155,7 +153,6 @@ distributed_type: NO
 downcast_bf16: 'no'
 machine_rank: 0
 main_training_function: main
-mixed_precision: no
 num_machines: 1
 num_processes: 1
 tpu_env: []
@@ -164,7 +161,6 @@ tpu_use_sudo: false
 use_cpu: true
 EOF
     echo "Generated CPU configuration"
-    MIXED_PRECISION="no"  # Override mixed precision for CPU
 fi
 
 # ================================
@@ -216,7 +212,6 @@ ARGS="$ARGS --sample_step $SAMPLE_STEP"
 ARGS="$ARGS --window_size $WINDOW_SIZE"
 ARGS="$ARGS --batch_size $BATCH_SIZE"
 ARGS="$ARGS --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
-ARGS="$ARGS --mixed_precision $MIXED_PRECISION"
 ARGS="$ARGS --hidden_size $HIDDEN_SIZE"
 ARGS="$ARGS --num_layers $NUM_LAYERS"
 ARGS="$ARGS --dropout $DROPOUT"
