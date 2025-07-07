@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Multi-node distributed training launcher for LSTM classifier using Accelerate
-# This script uses HuggingFace Accelerate for simplified distributed training
+# K-Fold cross-validation training launcher for LSTM classifier using Accelerate
+# This script uses HuggingFace Accelerate for distributed K-fold training
 
 set -e  # Exit on any error
 
@@ -14,34 +14,37 @@ DATA_DIR="data"
 SAMPLE_STEP=1
 WINDOW_SIZE=30
 BATCH_SIZE=32  # Per device batch size
+PCA_DIM=2
 
 # Model parameters
 HIDDEN_SIZE=128
-NUM_LAYERS=2
+NUM_LAYERS=6
 DROPOUT=0.2
 BIDIRECTIONAL=true
 
 # Training parameters
-NUM_EPOCHS=100
+NUM_EPOCHS=1000
 LEARNING_RATE=0.001
 WEIGHT_DECAY=1e-4
 PATIENCE=20
 GRAD_CLIP=1.0
 GRADIENT_ACCUMULATION_STEPS=2
-MIXED_PRECISION="fp16"  # Options: no, fp16, bf16
 SEED=42
+
+# K-Fold parameters
+K_FOLDS=5
 
 # Logging parameters
 USE_WANDB=false  # Set to true to use wandb
-WANDB_PROJECT="accelerated-lstm-training"
+WANDB_PROJECT="kfold-lstm-training"
 WANDB_ENTITY=""
-EXPERIMENT_NAME="accelerated_lstm_$(date +%Y%m%d_%H%M%S)"
+EXPERIMENT_NAME="kfold_lstm_$(date +%Y%m%d_%H%M%S)"
 
 # Output parameters
-RESULTS_DIR="./results_accelerated"
+RESULTS_DIR="./results/results_kfold"
 
 # Accelerate configuration
-ACCELERATE_CONFIG_FILE="./accelerate_config.yaml"
+ACCELERATE_CONFIG_FILE="./accelerate_kfold_config.yaml"
 
 # Script path
 SCRIPT_PATH="./src/trainers/distributed_trainer.py"
@@ -51,13 +54,14 @@ SCRIPT_PATH="./src/trainers/distributed_trainer.py"
 # ================================
 
 echo "================================="
-echo "Accelerated LSTM Training Script"
+echo "K-Fold LSTM Training Script with Accelerate"
 echo "================================="
 echo "Data Configuration:"
 echo "  Data Directory: $DATA_DIR"
 echo "  Sample Step: $SAMPLE_STEP"
 echo "  Window Size: $WINDOW_SIZE"
 echo "  Batch Size (per device): $BATCH_SIZE"
+echo "  PCA Dimension: $PCA_DIM"
 echo ""
 echo "Model Configuration:"
 echo "  Hidden Size: $HIDDEN_SIZE"
@@ -72,8 +76,10 @@ echo "  Weight Decay: $WEIGHT_DECAY"
 echo "  Patience: $PATIENCE"
 echo "  Gradient Clipping: $GRAD_CLIP"
 echo "  Gradient Accumulation Steps: $GRADIENT_ACCUMULATION_STEPS"
-echo "  Mixed Precision: $MIXED_PRECISION"
 echo "  Random Seed: $SEED"
+echo ""
+echo "K-Fold Configuration:"
+echo "  Number of Folds: $K_FOLDS"
 echo ""
 echo "Logging Configuration:"
 echo "  Use Wandb: $USE_WANDB"
@@ -82,6 +88,8 @@ if [ "$USE_WANDB" = true ]; then
     echo "  Experiment Name: $EXPERIMENT_NAME"
 else
     echo "  Training logs will be saved to local files in results directory"
+    echo "  Individual fold logs: training_history_fold_X.json"
+    echo "  Individual fold models: best_model_fold_X.pth"
 fi
 echo ""
 echo "Output Configuration:"
@@ -113,7 +121,7 @@ fi
 # Generate Accelerate Configuration
 # ================================
 
-echo "Generating Accelerate configuration..."
+echo "Generating Accelerate configuration for K-Fold training..."
 
 # Create accelerate config if it doesn't exist
 if [ ! -f "$ACCELERATE_CONFIG_FILE" ]; then
@@ -124,7 +132,7 @@ downcast_bf16: 'no'
 gpu_ids: all
 machine_rank: 0
 main_training_function: main
-mixed_precision: $MIXED_PRECISION
+mixed_precision: no
 num_machines: 1
 num_processes: $(python3 -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 1)")
 rdzv_backend: static
@@ -151,6 +159,7 @@ ARGS="--data_dir $DATA_DIR"
 ARGS="$ARGS --sample_step $SAMPLE_STEP"
 ARGS="$ARGS --window_size $WINDOW_SIZE"
 ARGS="$ARGS --batch_size $BATCH_SIZE"
+ARGS="$ARGS --pca_dim $PCA_DIM"
 ARGS="$ARGS --hidden_size $HIDDEN_SIZE"
 ARGS="$ARGS --num_layers $NUM_LAYERS"
 ARGS="$ARGS --dropout $DROPOUT"
@@ -160,8 +169,8 @@ ARGS="$ARGS --weight_decay $WEIGHT_DECAY"
 ARGS="$ARGS --patience $PATIENCE"
 ARGS="$ARGS --grad_clip $GRAD_CLIP"
 ARGS="$ARGS --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS"
-ARGS="$ARGS --mixed_precision $MIXED_PRECISION"
 ARGS="$ARGS --seed $SEED"
+ARGS="$ARGS --k_folds $K_FOLDS"
 ARGS="$ARGS --results_dir $RESULTS_DIR"
 ARGS="$ARGS --wandb_project $WANDB_PROJECT"
 
@@ -179,41 +188,82 @@ if [ -n "$WANDB_ENTITY" ]; then
 fi
 
 # ================================
-# Execute Training
+# Execute K-Fold Training
 # ================================
 
-echo "Starting accelerated training..."
+echo "Starting K-Fold training with accelerate..."
 echo "Command: accelerate launch --config_file $ACCELERATE_CONFIG_FILE $SCRIPT_PATH $ARGS"
 echo "================================="
 
-# Launch training with accelerate
+# Launch K-fold training with accelerate
 accelerate launch --config_file "$ACCELERATE_CONFIG_FILE" "$SCRIPT_PATH" $ARGS
 
 TRAINING_EXIT_CODE=$?
 
 echo "================================="
 if [ $TRAINING_EXIT_CODE -eq 0 ]; then
-    echo "Training completed successfully!"
+    echo "K-Fold training completed successfully!"
     echo "Results saved in: $RESULTS_DIR"
     
-    # Display some results if available
-    if [ -f "$RESULTS_DIR/training_history.json" ]; then
+    # Display results summary if available
+    echo ""
+    echo "K-Fold Results Summary:"
+    echo "======================="
+    
+    # Check for individual fold results
+    for ((i=1; i<=K_FOLDS; i++)); do
+        FOLD_DIR="$RESULTS_DIR/fold_$i"
+        if [ -d "$FOLD_DIR" ]; then
+            echo "Fold $i:"
+            if [ -f "$FOLD_DIR/best_model_fold_$i.pth" ]; then
+                echo "  ✓ Best model saved"
+            fi
+            if [ -f "$FOLD_DIR/training_history_fold_$i.json" ]; then
+                echo "  ✓ Training history saved"
+            fi
+            if [ -f "$FOLD_DIR/performance_metrics_fold_$i.json" ]; then
+                echo "  ✓ Performance metrics saved"
+            fi
+        fi
+    done
+    
+    echo ""
+    echo "Individual fold results are stored in: $RESULTS_DIR/fold_*/"
+    echo "Best models: $RESULTS_DIR/fold_*/best_model_fold_*.pth"
+    echo "Training histories: $RESULTS_DIR/fold_*/training_history_fold_*.json"
+    echo "Performance metrics: $RESULTS_DIR/fold_*/performance_metrics_fold_*.json"
+    
+    # Display GPU utilization summary if nvidia-smi is available
+    if command -v nvidia-smi &> /dev/null; then
         echo ""
-        echo "Training Summary:"
-        echo "Latest training history available at: $RESULTS_DIR/training_history.json"
+        echo "Current GPU Status:"
+        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits | \
+        awk -F', ' '{printf "  GPU: %s | Util: %s%% | Memory: %s/%s MB\n", $1, $2, $3, $4}'
     fi
     
-    if [ -f "$RESULTS_DIR/best_model.pth" ]; then
-        echo "Best model saved at: $RESULTS_DIR/best_model.pth"
-    fi
-    
-    if [ -f "$RESULTS_DIR/performance_metrics.json" ]; then
-        echo "Performance metrics available at: $RESULTS_DIR/performance_metrics.json"
-    fi
 else
-    echo "Training failed with exit code: $TRAINING_EXIT_CODE"
+    echo "K-Fold training failed with exit code: $TRAINING_EXIT_CODE"
     echo "Check the error messages above for details."
+    
+    # Check for partial results
+    echo ""
+    echo "Checking for partial results..."
+    COMPLETED_FOLDS=0
+    for ((i=1; i<=K_FOLDS; i++)); do
+        FOLD_DIR="$RESULTS_DIR/fold_$i"
+        if [ -d "$FOLD_DIR" ] && [ -f "$FOLD_DIR/best_model_fold_$i.pth" ]; then
+            COMPLETED_FOLDS=$((COMPLETED_FOLDS + 1))
+        fi
+    done
+    
+    if [ $COMPLETED_FOLDS -gt 0 ]; then
+        echo "Partial results available for $COMPLETED_FOLDS out of $K_FOLDS folds"
+        echo "Check individual fold directories for completed training"
+    else
+        echo "No completed folds found"
+    fi
 fi
+
 echo "================================="
 
 exit $TRAINING_EXIT_CODE

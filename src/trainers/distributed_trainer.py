@@ -1,4 +1,3 @@
-
 """
 Multi-node distributed training framework for LSTM classifier using HuggingFace Accelerate
 
@@ -50,30 +49,33 @@ except ImportError:
     print("Warning: wandb not installed. Logging will be done to local files only.")
     wandb = None
 
-
 class AcceleratedLSTMTrainer:
     """
     Accelerated LSTM trainer using HuggingFace Accelerate framework
     Supports multi-node, multi-GPU training with automatic mixed precision
     """
     
-    def __init__(self, model_config, train_config, accelerator=None):
+    def __init__(self, model_config, train_config, accelerator=None, fold_idx=None):
         """
         Initialize the accelerated trainer
         
         Args:
             model_config: Model configuration dictionary
             train_config: Training configuration dictionary
+            accelerator: Pre-initialized accelerator instance (optional)
+            fold_idx: Current fold index for tracking (optional)
         """
         if not ACCELERATE_AVAILABLE:
             raise ImportError("accelerate is required for distributed training. Install with 'pip install accelerate'")
         
         self.model_config = model_config
         self.train_config = train_config
+        self.fold_idx = fold_idx
         
-        # Initialize accelerator
+        # Initialize accelerator or use provided one
         if accelerator is not None:
             self.accelerator = accelerator
+            self.shared_accelerator = True
         else:
             self.accelerator = Accelerator(
                 gradient_accumulation_steps=train_config.get('gradient_accumulation_steps', 1),
@@ -81,13 +83,20 @@ class AcceleratedLSTMTrainer:
                 log_with=["wandb"] if train_config.get('use_wandb', False) and WANDB_AVAILABLE else None,
                 project_dir=train_config.get('results_dir', './results'),
             )
+            self.shared_accelerator = False
         
-        # Set random seed for reproducibility
+        # Set random seed for reproducibility (important for each fold)
         if train_config.get('seed'):
-            set_seed(train_config['seed'])
+            # Add fold_idx to seed to ensure different initialization for each fold
+            fold_seed = train_config['seed'] + (fold_idx if fold_idx is not None else 0)
+            set_seed(fold_seed)
         
-        # Initialize wandb if on main process
-        if self.accelerator.is_main_process and train_config.get('use_wandb', False) and WANDB_AVAILABLE:
+        # Initialize wandb only once per accelerator (not per fold)
+        if (self.accelerator.is_main_process and 
+            train_config.get('use_wandb', False) and 
+            WANDB_AVAILABLE and 
+            not self.shared_accelerator):
+            # Only initialize wandb if this is not a shared accelerator
             self.accelerator.init_trackers(
                 project_name=train_config.get('wandb_project', 'accelerated-lstm-training'),
                 config={**model_config, **train_config},
@@ -97,10 +106,10 @@ class AcceleratedLSTMTrainer:
         else:
             self.use_wandb = False
         
-        # Create model
+        # Create model (fresh for each fold)
         self.model = LSTMClassifier(**model_config).to(torch.float64)
         
-        # Setup optimizer and scheduler
+        # Setup optimizer and scheduler (fresh for each fold)
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=train_config['learning_rate'],
@@ -109,7 +118,7 @@ class AcceleratedLSTMTrainer:
         
         self.criterion = nn.CrossEntropyLoss()
         
-        # Training history
+        # Training history (fresh for each fold)
         self.train_history = {
             'train_loss': [],
             'train_acc': [],
@@ -118,7 +127,44 @@ class AcceleratedLSTMTrainer:
             'learning_rates': []
         }
         
-        # Performance metrics
+        # Performance metrics (fresh for each fold)
+        self.performance_metrics = {
+            'throughput': [],
+            'memory_usage': [],
+            'training_time': []
+        }
+    
+    def reset_for_new_fold(self, fold_idx):
+        """
+        Reset trainer state for a new fold while keeping the same accelerator
+        """
+        self.fold_idx = fold_idx
+        
+        # Reset random seed with fold-specific seed
+        if self.train_config.get('seed'):
+            fold_seed = self.train_config['seed'] + fold_idx
+            set_seed(fold_seed)
+        
+        # Create new model for this fold
+        self.model = LSTMClassifier(**self.model_config).to(torch.float64)
+        
+        # Create new optimizer for this fold
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.train_config['learning_rate'],
+            weight_decay=self.train_config.get('weight_decay', 1e-4)
+        )
+        
+        # Reset training history
+        self.train_history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'learning_rates': []
+        }
+        
+        # Reset performance metrics
         self.performance_metrics = {
             'throughput': [],
             'memory_usage': [],
@@ -126,7 +172,7 @@ class AcceleratedLSTMTrainer:
         }
     
     def create_scheduler(self, optimizer):
-        """Create learning rate scheduler"""
+        """Create learning rate scheduler (fresh for each fold)"""
         return optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='min', 
@@ -174,7 +220,6 @@ class AcceleratedLSTMTrainer:
             x_batch, u_batch, p_batch = batch
             x_batch = x_batch.to(torch.float64)
             u_batch = u_batch.to(torch.float64)
-
             
             # Convert one-hot to class indices if needed
             if p_batch.dim() > 1 and p_batch.size(1) > 1:
@@ -202,10 +247,6 @@ class AcceleratedLSTMTrainer:
                 
                 # Optimizer step
                 self.optimizer.step()
-                
-                # Learning rate scheduler step (only when gradients are synchronized)
-                # if self.accelerator.sync_gradients:
-                    # self.scheduler.step()
             
             # Statistics
             total_loss += loss.item()
@@ -246,7 +287,6 @@ class AcceleratedLSTMTrainer:
                 x_batch, u_batch, p_batch = batch
                 x_batch = x_batch.to(torch.float64)
                 u_batch = u_batch.to(torch.float64)
-
                 
                 # Convert one-hot to class indices if needed
                 if p_batch.dim() > 1 and p_batch.size(1) > 1:
@@ -268,7 +308,7 @@ class AcceleratedLSTMTrainer:
         return avg_loss, accuracy
     
     def save_checkpoint(self, epoch, val_acc, is_best=False):
-        """Save checkpoint (only on main process)"""
+        """Save checkpoint (only on main process) - each fold saves to its own directory"""
         if not self.accelerator.is_main_process:
             return
         
@@ -281,13 +321,16 @@ class AcceleratedLSTMTrainer:
             'train_history': self.train_history,
             'model_config': self.model_config,
             'train_config': self.train_config,
-            'accelerator_state': self.accelerator.get_state_dict(self.model)
+            'fold_idx': self.fold_idx
         }
+        
+        # Create fold-specific checkpoint filename
+        fold_suffix = f"_fold_{self.fold_idx + 1}" if self.fold_idx is not None else ""
         
         # Save latest checkpoint
         checkpoint_path = os.path.join(
             self.train_config['results_dir'], 
-            'latest_checkpoint.pth'
+            f'latest_checkpoint{fold_suffix}.pth'
         )
         torch.save(checkpoint, checkpoint_path)
         
@@ -295,10 +338,11 @@ class AcceleratedLSTMTrainer:
         if is_best:
             best_path = os.path.join(
                 self.train_config['results_dir'], 
-                'best_model.pth'
+                f'best_model{fold_suffix}.pth'
             )
             torch.save(checkpoint, best_path)
-            self.accelerator.print(f"New best model saved with validation accuracy: {val_acc:.4f}")
+            fold_info = f"Fold {self.fold_idx + 1} - " if self.fold_idx is not None else ""
+            self.accelerator.print(f"{fold_info}New best model saved with validation accuracy: {val_acc:.4f}")
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint for resuming training"""
@@ -312,14 +356,12 @@ class AcceleratedLSTMTrainer:
             if 'scheduler_state_dict' in checkpoint:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
-            if 'accelerator_state' in checkpoint:
-                self.accelerator.set_state_dict(checkpoint['accelerator_state'])
-            
             self.train_history = checkpoint.get('train_history', self.train_history)
             
             if self.accelerator.is_main_process:
-                self.accelerator.print(f"Checkpoint loaded from {checkpoint_path}")
-                self.accelerator.print(f"Resuming from epoch {checkpoint['epoch']} with val_acc {checkpoint['val_accuracy']:.4f}")
+                fold_info = f"Fold {checkpoint.get('fold_idx', 0) + 1} - " if checkpoint.get('fold_idx') is not None else ""
+                self.accelerator.print(f"{fold_info}Checkpoint loaded from {checkpoint_path}")
+                self.accelerator.print(f"{fold_info}Resuming from epoch {checkpoint['epoch']} with val_acc {checkpoint['val_accuracy']:.4f}")
             
             return checkpoint['epoch'], checkpoint['val_accuracy']
         
@@ -335,16 +377,18 @@ class AcceleratedLSTMTrainer:
         gradient_accumulation_steps = self.train_config.get('gradient_accumulation_steps', 1)
         num_training_steps = len(train_loader) * num_epochs // gradient_accumulation_steps
         
-        # Create scheduler
+        # Create scheduler (fresh for each fold)
         self.scheduler = self.create_scheduler(self.optimizer)
         
         # Prepare everything with accelerator
+        # Note: This creates new distributed wrappers for each fold
         self.model, self.optimizer, train_loader, val_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, train_loader, val_loader, self.scheduler
         )
         
-        # Try to resume from checkpoint
-        checkpoint_path = os.path.join(self.train_config['results_dir'], 'latest_checkpoint.pth')
+        # Try to resume from checkpoint (fold-specific)
+        fold_suffix = f"_fold_{self.fold_idx + 1}" if self.fold_idx is not None else ""
+        checkpoint_path = os.path.join(self.train_config['results_dir'], f'latest_checkpoint{fold_suffix}.pth')
         start_epoch, best_val_acc = self.load_checkpoint(checkpoint_path)
         
         # Training parameters
@@ -352,7 +396,8 @@ class AcceleratedLSTMTrainer:
         patience = self.train_config.get('patience', 20)
         
         if self.accelerator.is_main_process:
-            self.accelerator.print(f"Starting training on {self.accelerator.num_processes} processes")
+            fold_info = f"Fold {self.fold_idx + 1}" if self.fold_idx is not None else "Training"
+            self.accelerator.print(f"Starting {fold_info} on {self.accelerator.num_processes} processes")
             self.accelerator.print(f"Device: {self.accelerator.device}")
             self.accelerator.print(f"Mixed precision: {self.accelerator.mixed_precision}")
             self.accelerator.print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -372,10 +417,12 @@ class AcceleratedLSTMTrainer:
             
             # Validation
             val_loss, val_acc = self.validate_epoch(val_loader)
+            
+            # Learning rate scheduling (using ReduceLROnPlateau)
             self.scheduler.step(val_loss)
             
             # Record metrics
-            current_lr = self.scheduler.get_last_lr()[0]
+            current_lr = self.optimizer.param_groups[0]['lr']
             epoch_time = time.time() - start_time
             
             self.train_history['train_loss'].append(train_loss)
@@ -398,7 +445,8 @@ class AcceleratedLSTMTrainer:
             
             # Logging (main process only)
             if self.accelerator.is_main_process:
-                self.accelerator.print(f"Epoch [{epoch+1}/{num_epochs}]:")
+                fold_info = f"Fold {self.fold_idx + 1} - " if self.fold_idx is not None else ""
+                self.accelerator.print(f"{fold_info}Epoch [{epoch+1}/{num_epochs}]:")
                 self.accelerator.print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
                 self.accelerator.print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
                 self.accelerator.print(f"  Learning Rate: {current_lr:.6f}")
@@ -407,7 +455,7 @@ class AcceleratedLSTMTrainer:
                     self.accelerator.print(f"  Throughput: {self.performance_metrics['throughput'][-1]:.2f} samples/sec")
                 self.accelerator.print("-" * 60)
                 
-                # Log to wandb
+                # Log to wandb with fold information
                 if self.use_wandb:
                     log_dict = {
                         'epoch': epoch + 1,
@@ -419,6 +467,8 @@ class AcceleratedLSTMTrainer:
                         'epoch_time': epoch_time,
                         'best_val_accuracy': best_val_acc
                     }
+                    if self.fold_idx is not None:
+                        log_dict['fold'] = self.fold_idx + 1
                     if self.performance_metrics['throughput']:
                         log_dict['throughput'] = self.performance_metrics['throughput'][-1]
                     
@@ -432,24 +482,22 @@ class AcceleratedLSTMTrainer:
         
         # Training completion
         if self.accelerator.is_main_process:
-            self.accelerator.print(f"Training completed. Best validation accuracy: {best_val_acc:.4f}")
+            fold_info = f"Fold {self.fold_idx + 1} " if self.fold_idx is not None else ""
+            self.accelerator.print(f"{fold_info}training completed. Best validation accuracy: {best_val_acc:.4f}")
             
-            # Save final training history
-            history_path = os.path.join(self.train_config['results_dir'], 'training_history.json')
+            # Save final training history with fold info
+            history_filename = f'training_history_fold_{self.fold_idx + 1}.json' if self.fold_idx is not None else 'training_history.json'
+            history_path = os.path.join(self.train_config['results_dir'], history_filename)
             with open(history_path, 'w') as f:
                 json.dump(self.train_history, f, indent=2)
             
-            # Save performance metrics
-            metrics_path = os.path.join(self.train_config['results_dir'], 'performance_metrics.json')
+            # Save performance metrics with fold info
+            metrics_filename = f'performance_metrics_fold_{self.fold_idx + 1}.json' if self.fold_idx is not None else 'performance_metrics.json'
+            metrics_path = os.path.join(self.train_config['results_dir'], metrics_filename)
             with open(metrics_path, 'w') as f:
                 json.dump(self.performance_metrics, f, indent=2)
-            
-            if self.use_wandb:
-                self.accelerator.end_training()
         
         return best_val_acc
-
-
 def main():
     parser = argparse.ArgumentParser(description='K-Fold Accelerated LSTM Training')
 
@@ -485,6 +533,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Initialize accelerator
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision='no',
+        log_with=["wandb"] if args.use_wandb and WANDB_AVAILABLE else None,
+        project_dir=args.results_dir,
+    )
+    
+    # Initialize wandb once for the entire K-fold experiment
+    if accelerator.is_main_process and args.use_wandb and WANDB_AVAILABLE:
+        accelerator.init_trackers(
+            project_name=args.wandb_project,
+            config=vars(args),
+            init_kwargs={"wandb": {"name": f"kfold_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"}}
+        )
+    
     # Step 1: Load full dataset
     data_config = {
         'window_size': args.window_size,
@@ -506,29 +570,10 @@ def main():
         pca_dim=args.pca_dim
     )
 
-    train_config = {
-        'batch_size': args.batch_size,
-        'num_epochs': args.num_epochs,
-        'learning_rate': args.learning_rate,
-        'weight_decay': args.weight_decay,
-        'patience': args.patience,
-        'grad_clip': args.grad_clip,
-        'gradient_accumulation_steps': args.gradient_accumulation_steps,
-        'seed': args.seed,
-        'results_dir': fold_result_dir,
-        'use_wandb': args.use_wandb,
-        'wandb_project': args.wandb_project
-    }
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=train_config.get('gradient_accumulation_steps', 1),
-        mixed_precision='no',
-        log_with=["wandb"] if train_config.get('use_wandb', False) and WANDB_AVAILABLE else None,
-        project_dir=train_config.get('results_dir', './results'),
-    )
-
-    # Step 3: Train across folds
+    # Step 3: Train across folds with shared accelerator
     fold_accuracies = []
+    trainer = None  # Initialize trainer once
+    
     for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
         print(f"\n========================\n Fold {fold_idx + 1}/{args.k_folds}\n========================")
 
@@ -543,17 +588,57 @@ def main():
             'dropout': args.dropout,
             'bidirectional': args.bidirectional
         }
-        print(model_config)
+        
+        train_config = {
+            'batch_size': args.batch_size,
+            'num_epochs': args.num_epochs,
+            'learning_rate': args.learning_rate,
+            'weight_decay': args.weight_decay,
+            'patience': args.patience,
+            'grad_clip': args.grad_clip,
+            'gradient_accumulation_steps': args.gradient_accumulation_steps,
+            'seed': args.seed,
+            'results_dir': fold_result_dir,
+            'use_wandb': args.use_wandb,
+            'wandb_project': args.wandb_project
+        }
 
-        trainer = AcceleratedLSTMTrainer(model_config, train_config, accelerator=accelerator)
+        if trainer is None:
+            # Create trainer for first fold
+            trainer = AcceleratedLSTMTrainer(model_config, train_config, accelerator=accelerator, fold_idx=fold_idx)
+        else:
+            # Reset trainer for subsequent folds
+            trainer.reset_for_new_fold(fold_idx)
+            trainer.train_config['results_dir'] = fold_result_dir  # Update results directory
+
+        print(model_config)
+        
         best_val_acc = trainer.train(train_loader.dataset, val_loader.dataset)
         fold_accuracies.append(best_val_acc)
+        
+        # Log fold completion to wandb
+        if accelerator.is_main_process and args.use_wandb and WANDB_AVAILABLE:
+            accelerator.log({
+                f'fold_{fold_idx + 1}_final_accuracy': best_val_acc,
+                'completed_folds': fold_idx + 1
+            })
 
     # Step 4: Summary
     print("\n===== K-Fold Summary =====")
     for i, acc in enumerate(fold_accuracies):
         print(f"Fold {i + 1}: {acc:.4f}")
-    print(f"Average Accuracy: {np.mean(fold_accuracies):.4f}")
+    avg_accuracy = np.mean(fold_accuracies)
+    std_accuracy = np.std(fold_accuracies)
+    print(f"Average Accuracy: {avg_accuracy:.4f} ± {std_accuracy:.4f}")
+    
+    # Final logging to wandb
+    if accelerator.is_main_process and args.use_wandb and WANDB_AVAILABLE:
+        accelerator.log({
+            'final_average_accuracy': avg_accuracy,
+            'final_std_accuracy': std_accuracy,
+            'all_fold_accuracies': fold_accuracies
+        })
+        accelerator.end_training()
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float64)
