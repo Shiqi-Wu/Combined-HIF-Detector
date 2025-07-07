@@ -13,7 +13,7 @@ set -e  # Exit on any error
 DATA_DIR="data"
 SAMPLE_STEP=1
 WINDOW_SIZE=30
-BATCH_SIZE=32  # Per device batch size
+BATCH_SIZE=4096  # Per device batch size
 PCA_DIM=2
 
 # Model parameters
@@ -23,7 +23,7 @@ DROPOUT=0.2
 BIDIRECTIONAL=true
 
 # Training parameters
-NUM_EPOCHS=1000
+NUM_EPOCHS=10
 LEARNING_RATE=0.001
 WEIGHT_DECAY=1e-4
 PATIENCE=20
@@ -41,7 +41,7 @@ WANDB_ENTITY=""
 EXPERIMENT_NAME="kfold_lstm_$(date +%Y%m%d_%H%M%S)"
 
 # Output parameters
-RESULTS_DIR="./results/results_kfold"
+RESULTS_DIR="./results/results_kfold1"
 
 # Accelerate configuration
 ACCELERATE_CONFIG_FILE="./accelerate_kfold_config.yaml"
