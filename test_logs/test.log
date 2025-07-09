@@ -1,0 +1,16 @@
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - Testing logger functionality
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - ============================================================
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - SYSTEM INFORMATION
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - ============================================================
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - Python version: 3.11.13 (main, Jun  5 2025, 13:12:00) [GCC 11.2.0]
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - PyTorch version: 2.5.1
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - CUDA available: True
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - CUDA version: 12.4
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - GPU count: 4
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - GPU 0: NVIDIA GeForce RTX 3090
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - GPU 1: NVIDIA GeForce RTX 3090
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - GPU 2: NVIDIA GeForce RTX 3090
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - GPU 3: NVIDIA GeForce RTX 3090
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - Accelerate available: True
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - WandB available: True
+2025-07-09 17:19:44 - TEST_LOGGER - INFO - ============================================================

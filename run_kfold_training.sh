@@ -35,13 +35,13 @@ SEED=42
 K_FOLDS=5
 
 # Logging parameters
-USE_WANDB=false  # Set to true to use wandb
+USE_WANDB=true  # Set to true to use wandb
 WANDB_PROJECT="kfold-lstm-training"
 WANDB_ENTITY=""
 EXPERIMENT_NAME="kfold_lstm_$(date +%Y%m%d_%H%M%S)"
 
 # Output parameters
-RESULTS_DIR="./results/results_kfold_2gpu_6144"
+RESULTS_DIR="./results/results_kfold_2gpu_6144_2"
 
 # Accelerate configuration
 ACCELERATE_CONFIG_FILE="./accelerate_kfold_config.yaml"
