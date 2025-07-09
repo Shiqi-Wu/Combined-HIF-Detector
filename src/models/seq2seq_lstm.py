@@ -3,13 +3,14 @@ Sequence-to-Sequence LSTM model for u(t) generation
 Simple approach: u(t) depends on x(0:t) and u(0:t-1) through encoder-decoder architecture
 
 Model Architecture:
-- Encoder: Processes state sequences x(0:t) to capture temporal dependencies
+- Encoder: Processes PCA-reduced state sequences x(0:t) to capture temporal dependencies
 - Decoder: Generates control sequences u(t) step by step
 - Teacher forcing during training, autoregressive during inference
 - Direct mapping from state history to control output
 
 Key Dependencies:
 - u(t) = f(x(0:t), u(0:t-1))
+- x(t) is PCA-processed state (typically 2D after dimensionality reduction)
 - Encoder provides rich representation of state history
 - Decoder generates control signals autoregressively
 """
@@ -46,7 +47,7 @@ class Seq2SeqLSTM(nn.Module):
         Initialize Seq2Seq LSTM model
         
         Args:
-            state_dim: Dimension of state signals x(t)
+            state_dim: Dimension of PCA-processed state signals x(t) (typically 2)
             control_dim: Dimension of control signals u(t)
             hidden_size: Hidden size for LSTM layers
             num_layers: Number of LSTM layers
@@ -401,8 +402,8 @@ def analyze_model_complexity(model: Seq2SeqLSTM) -> dict:
 if __name__ == "__main__":
     # Test model instantiation
     model = Seq2SeqLSTM(
-        state_dim=68,
-        control_dim=10,
+        state_dim=2,  # PCA-processed state dimension
+        control_dim=2,  # Control signal dimension (from data columns -6:-4)
         hidden_size=128,
         num_layers=2,
         dropout=0.2,
@@ -425,10 +426,10 @@ if __name__ == "__main__":
         print(f"{key}: {value}")
     
     # Test forward pass
-    batch_size, seq_len, state_dim, control_dim = 2, 30, 68, 10
+    batch_size, seq_len, state_dim, control_dim = 2, 30, 2, 2  # Both state and control are 2D
     
-    x = torch.randn(batch_size, seq_len, state_dim)  # State sequences x(0:T)
-    u = torch.randn(batch_size, seq_len, control_dim)  # Control sequences u(0:T)
+    x = torch.randn(batch_size, seq_len, state_dim)  # State sequences x(0:T) - PCA processed
+    u = torch.randn(batch_size, seq_len, control_dim)  # Control sequences u(0:T) - 2D control signals
     
     # Training mode (with teacher forcing)
     model.train()
