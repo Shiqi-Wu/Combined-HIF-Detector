@@ -21,6 +21,7 @@ import json
 import argparse
 from datetime import datetime
 import numpy as np
+import pandas as pd
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
@@ -441,14 +442,17 @@ class AcceleratedLSTMTrainer:
         
         for batch_idx, batch in enumerate(progress_bar):
             x_batch, u_batch, p_batch = batch
-            x_batch = x_batch.to(torch.float64)
-            u_batch = u_batch.to(torch.float64)
+            x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
+            u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
             
             # Convert one-hot to class indices if needed
             if p_batch.dim() > 1 and p_batch.size(1) > 1:
                 p_indices = torch.argmax(p_batch, dim=1)
             else:
                 p_indices = p_batch.long()
+            
+            # Move targets to the same device as model
+            p_indices = p_indices.to(self.accelerator.device)
             
             with self.accelerator.accumulate(self.model):
                 # Zero gradients
@@ -508,14 +512,17 @@ class AcceleratedLSTMTrainer:
         with torch.no_grad():
             for batch in val_loader:
                 x_batch, u_batch, p_batch = batch
-                x_batch = x_batch.to(torch.float64)
-                u_batch = u_batch.to(torch.float64)
+                x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
+                u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
                 
                 # Convert one-hot to class indices if needed
                 if p_batch.dim() > 1 and p_batch.size(1) > 1:
                     p_indices = torch.argmax(p_batch, dim=1)
                 else:
                     p_indices = p_batch.long()
+                
+                # Move targets to the same device as model
+                p_indices = p_indices.to(self.accelerator.device)
                 
                 outputs = self.model(x_batch)
                 loss = self.criterion(outputs, p_indices)
@@ -530,8 +537,111 @@ class AcceleratedLSTMTrainer:
         
         return avg_loss, accuracy
     
-    def save_checkpoint(self, epoch, val_acc, is_best=False):
-        """Save checkpoint (only on main process) - each fold saves to its own directory"""
+    def evaluate_model_on_datasets(self, train_dataset, val_dataset, test_dataset):
+        """Evaluate model on train, validation, and test datasets"""
+        self.model.eval()
+        results = {}
+        
+        # Evaluate on each dataset
+        datasets = {
+            'train': train_dataset,
+            'val': val_dataset,
+            'test': test_dataset
+        }
+        
+        with torch.no_grad():
+            for dataset_name, dataset in datasets.items():
+                if dataset is None:
+                    continue
+                    
+                # Create temporary dataloader for evaluation
+                eval_loader = DataLoader(
+                    dataset,
+                    batch_size=self.train_config['batch_size'],
+                    shuffle=False,
+                    num_workers=0
+                )
+                
+                total_loss = 0
+                total_correct = 0
+                total_samples = 0
+                
+                for batch in eval_loader:
+                    x_batch, u_batch, p_batch = batch
+                    x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
+                    u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
+                    
+                    # Convert one-hot to class indices if needed
+                    if p_batch.dim() > 1 and p_batch.size(1) > 1:
+                        p_indices = torch.argmax(p_batch, dim=1)
+                    else:
+                        p_indices = p_batch.long()
+                    
+                    # Move targets to the same device as model
+                    p_indices = p_indices.to(self.accelerator.device)
+                    
+                    outputs = self.model(x_batch)
+                    loss = self.criterion(outputs, p_indices)
+                    
+                    total_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_samples += p_indices.size(0)
+                    total_correct += (predicted == p_indices).sum().item()
+                
+                avg_loss = total_loss / len(eval_loader)
+                accuracy = total_correct / total_samples
+                
+                results[dataset_name] = {
+                    'loss': avg_loss,
+                    'accuracy': accuracy
+                }
+                
+                if self.accelerator.is_main_process:
+                    self.logger.info(f"  {dataset_name.capitalize()} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+        
+        return results
+    
+    def save_evaluation_to_csv(self, epoch, results):
+        """Save evaluation results to CSV file"""
+        if not self.accelerator.is_main_process:
+            return
+        
+        # Create CSV file path
+        fold_suffix = f"_fold_{self.fold_idx + 1}" if self.fold_idx is not None else ""
+        csv_path = os.path.join(
+            self.train_config['results_dir'], 
+            f'evaluation_results{fold_suffix}.csv'
+        )
+        
+        # Prepare data for CSV
+        csv_data = {
+            'epoch': epoch + 1,
+            'timestamp': datetime.now().isoformat(),
+            'fold': self.fold_idx + 1 if self.fold_idx is not None else 0
+        }
+        
+        # Add train, val, test metrics
+        for dataset_name in ['train', 'val', 'test']:
+            if dataset_name in results:
+                csv_data[f'{dataset_name}_loss'] = results[dataset_name]['loss']
+                csv_data[f'{dataset_name}_accuracy'] = results[dataset_name]['accuracy']
+            else:
+                csv_data[f'{dataset_name}_loss'] = None
+                csv_data[f'{dataset_name}_accuracy'] = None
+        
+        # Create DataFrame
+        df = pd.DataFrame([csv_data])
+        
+        # Write to CSV (append if file exists)
+        if os.path.exists(csv_path):
+            df.to_csv(csv_path, mode='a', header=False, index=False)
+        else:
+            df.to_csv(csv_path, mode='w', header=True, index=False)
+        
+        self.logger.info(f"Evaluation results saved to {csv_path}")
+    
+    def save_checkpoint(self, epoch, val_acc, train_dataset=None, val_dataset=None, test_dataset=None, is_best=False):
+        """Save checkpoint and evaluate model on all datasets if it's the best model"""
         if not self.accelerator.is_main_process:
             return
         
@@ -558,7 +668,7 @@ class AcceleratedLSTMTrainer:
         torch.save(checkpoint, checkpoint_path)
         self.logger.info(f"Saved checkpoint to {checkpoint_path}")
         
-        # Save best model
+        # Save best model and evaluate on all datasets
         if is_best:
             best_path = os.path.join(
                 self.train_config['results_dir'], 
@@ -568,6 +678,12 @@ class AcceleratedLSTMTrainer:
             fold_info = f"Fold {self.fold_idx + 1} - " if self.fold_idx is not None else ""
             self.logger.info(f"{fold_info}New best model saved with validation accuracy: {val_acc:.4f}")
             self.accelerator.print(f"{fold_info}New best model saved with validation accuracy: {val_acc:.4f}")
+            
+            # Evaluate on all datasets and save to CSV
+            if train_dataset is not None or val_dataset is not None or test_dataset is not None:
+                self.logger.info(f"{fold_info}Evaluating best model on all datasets...")
+                results = self.evaluate_model_on_datasets(train_dataset, val_dataset, test_dataset)
+                self.save_evaluation_to_csv(epoch, results)
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint for resuming training"""
@@ -597,7 +713,7 @@ class AcceleratedLSTMTrainer:
         
         return 0, 0.0
     
-    def train(self, train_dataset, val_dataset):
+    def train(self, train_dataset, val_dataset, test_dataset=None):
         """Main training loop"""
         if self.accelerator.is_main_process:
             self.logger.info("="*60)
@@ -694,7 +810,7 @@ class AcceleratedLSTMTrainer:
                 patience_counter += 1
             
             # Save checkpoint
-            self.save_checkpoint(epoch, val_acc, is_best)
+            self.save_checkpoint(epoch, val_acc, train_dataset, val_dataset, test_dataset, is_best)
             
             # Logging (main process only)
             if self.accelerator.is_main_process:
@@ -822,6 +938,9 @@ def main():
         level=logging.INFO,
         console_output=True
     )
+    
+    # Setup exception handling early to catch all errors
+    setup_exception_handling(main_logger)
 
     # Log system info
     log_system_info(main_logger)
@@ -866,7 +985,7 @@ def main():
     # Step 2: Create K-Fold Dataloaders with shared preprocessing
     main_logger.info("\n===== Creating K-Fold Splits with Shared Preprocessing =====")
     print("\n===== Creating K-Fold Splits with Shared Preprocessing =====")
-    folds, preprocessing_params = create_preprocessed_kfold_dataloaders(
+    folds, test_loader, preprocessing_params = create_preprocessed_kfold_dataloaders(
         dataset,
         file_labels,
         config=data_config,
@@ -875,12 +994,13 @@ def main():
         pca_dim=args.pca_dim
     )
     main_logger.info(f"Created {args.k_folds} folds with PCA dimension {args.pca_dim}")
+    main_logger.info(f"Test set size: {len(test_loader.dataset)} samples")
 
     # Step 3: Train across folds with shared accelerator
     fold_accuracies = []
     trainer = None  # Initialize trainer once
     
-    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(folds):
+    for fold_idx, (train_loader, val_loader) in enumerate(folds):
         main_logger.info(f"\n========================\n Fold {fold_idx + 1}/{args.k_folds}\n========================")
         print(f"\n========================\n Fold {fold_idx + 1}/{args.k_folds}\n========================")
 
@@ -924,7 +1044,7 @@ def main():
         print(model_config)
         
         fold_start_time = time.time()
-        best_val_acc = trainer.train(train_loader.dataset, val_loader.dataset)
+        best_val_acc = trainer.train(train_loader.dataset, val_loader.dataset, test_loader.dataset)
         fold_time = time.time() - fold_start_time
         
         fold_accuracies.append(best_val_acc)
@@ -964,6 +1084,43 @@ def main():
     with open(summary_path, 'w') as f:
         json.dump(summary_results, f, indent=2)
     main_logger.info(f"Summary results saved to {summary_path}")
+    
+    # Create combined evaluation results CSV
+    if accelerator.is_main_process:
+        main_logger.info("Creating combined evaluation results CSV...")
+        combined_csv_path = os.path.join(args.results_dir, 'combined_evaluation_results.csv')
+        
+        # Collect all fold evaluation results
+        all_fold_results = []
+        for fold_idx in range(args.k_folds):
+            fold_csv_path = os.path.join(args.results_dir, f"fold_{fold_idx + 1}", f'evaluation_results_fold_{fold_idx + 1}.csv')
+            if os.path.exists(fold_csv_path):
+                try:
+                    fold_df = pd.read_csv(fold_csv_path)
+                    all_fold_results.append(fold_df)
+                    main_logger.info(f"  Added fold {fold_idx + 1} evaluation results")
+                except Exception as e:
+                    main_logger.warning(f"  Could not read fold {fold_idx + 1} results: {e}")
+        
+        # Combine all results
+        if all_fold_results:
+            combined_df = pd.concat(all_fold_results, ignore_index=True)
+            combined_df.to_csv(combined_csv_path, index=False)
+            main_logger.info(f"Combined evaluation results saved to {combined_csv_path}")
+            
+            # Show summary statistics
+            main_logger.info("Evaluation Summary:")
+            for dataset in ['train', 'val', 'test']:
+                acc_col = f'{dataset}_accuracy'
+                loss_col = f'{dataset}_loss'
+                if acc_col in combined_df.columns:
+                    mean_acc = combined_df[acc_col].mean()
+                    std_acc = combined_df[acc_col].std()
+                    mean_loss = combined_df[loss_col].mean()
+                    std_loss = combined_df[loss_col].std()
+                    main_logger.info(f"  {dataset.upper()} - Accuracy: {mean_acc:.4f} ± {std_acc:.4f}, Loss: {mean_loss:.4f} ± {std_loss:.4f}")
+        else:
+            main_logger.warning("No fold evaluation results found to combine")
     
     # Final logging to wandb
     if accelerator.is_main_process and args.use_wandb and WANDB_AVAILABLE:

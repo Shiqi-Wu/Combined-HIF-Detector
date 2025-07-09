@@ -220,7 +220,7 @@ def load_full_dataset(data_dir, config, delete_columns=[9, 21, 25, 39, 63]):
 
 def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_state=42):
     """
-    Create k-fold cross validation dataloaders
+    Create k-fold cross validation dataloaders with train/val/test split
     
     Args:
         dataset: Complete dataset
@@ -231,6 +231,7 @@ def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_st
     
     Returns:
         fold_dataloaders: List of (train_loader, val_loader, test_loader) for each fold
+        test_loader: Fixed test loader (same for all folds)
     """
     
     # Create file-level indices
@@ -255,7 +256,7 @@ def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_st
     for file_idx in test_files:
         test_indices.extend(file_to_sample_indices[file_idx])
     
-    # Create test dataset
+    # Create test dataset (shared across all folds)
     test_dataset = Subset(dataset, test_indices)
     test_loader = DataLoader(
         test_dataset,
@@ -312,12 +313,12 @@ def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_st
             num_workers=0
         )
         
-        fold_dataloaders.append((train_loader_fold, val_loader_fold, test_loader))
+        fold_dataloaders.append((train_loader_fold, val_loader_fold))
         
         print(f"  Fold {fold_idx + 1}: Train samples: {len(train_indices_fold)}, "
               f"Val samples: {len(val_indices_fold)}, Test samples: {len(test_indices)}")
     
-    return fold_dataloaders
+    return fold_dataloaders, test_loader
 
 
 def create_preprocessed_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_state=42, pca_dim=2):
@@ -333,13 +334,14 @@ def create_preprocessed_kfold_dataloaders(dataset, file_labels, config, n_splits
         pca_dim: Number of PCA components
 
     Returns:
-        fold_dataloaders: List of (train_loader, val_loader, test_loader) for each fold
+        fold_dataloaders: List of (train_loader, val_loader) for each fold
+        test_loader: Fixed test loader (same for all folds)
         preprocessing_params: Shared preprocessing parameters used for all folds
     """
     from torch.utils.data import DataLoader
 
     # First get the basic fold dataloaders
-    fold_dataloaders = create_kfold_dataloaders(dataset, file_labels, config, n_splits, random_state)
+    fold_dataloaders, test_loader = create_kfold_dataloaders(dataset, file_labels, config, n_splits, random_state)
 
     print("Fitting shared preprocessing parameters on full dataset...")
     scaler_dataset = ScaledDataset(dataset, pca_dim=pca_dim, fit_scalers=True)
@@ -347,25 +349,27 @@ def create_preprocessed_kfold_dataloaders(dataset, file_labels, config, n_splits
 
     preprocessed_fold_dataloaders = []
 
-    for fold_idx, (train_loader, val_loader, test_loader) in enumerate(fold_dataloaders):
+    for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders):
         print(f"Applying shared preprocessing to fold {fold_idx + 1}/{n_splits}")
 
         train_scaled = ScaledDataset(train_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
         train_scaled.set_preprocessing_params(shared_params)
         val_scaled = ScaledDataset(val_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
         val_scaled.set_preprocessing_params(shared_params)
-        test_scaled = ScaledDataset(test_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
-        test_scaled.set_preprocessing_params(shared_params)
 
         train_loader_scaled = DataLoader(train_scaled, batch_size=config.get('batch_size', 32), shuffle=True, num_workers=0)
         val_loader_scaled = DataLoader(val_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
-        test_loader_scaled = DataLoader(test_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
 
-        preprocessed_fold_dataloaders.append((train_loader_scaled, val_loader_scaled, test_loader_scaled))
+        preprocessed_fold_dataloaders.append((train_loader_scaled, val_loader_scaled))
 
         print(f"  Fold {fold_idx + 1}: Preprocessing applied successfully")
+    
+    # Apply preprocessing to test loader
+    test_scaled = ScaledDataset(test_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
+    test_scaled.set_preprocessing_params(shared_params)
+    test_loader_scaled = DataLoader(test_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
 
-    return preprocessed_fold_dataloaders, shared_params
+    return preprocessed_fold_dataloaders, test_loader_scaled, shared_params
 
 
 class ScaledDataset(Dataset):
