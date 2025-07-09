@@ -403,7 +403,7 @@ if __name__ == "__main__":
     # Test model instantiation
     model = Seq2SeqLSTM(
         state_dim=2,  # PCA-processed state dimension
-        control_dim=2,  # Control signal dimension (from data columns -6:-4)
+        control_dim=10,
         hidden_size=128,
         num_layers=2,
         dropout=0.2,
@@ -426,10 +426,10 @@ if __name__ == "__main__":
         print(f"{key}: {value}")
     
     # Test forward pass
-    batch_size, seq_len, state_dim, control_dim = 2, 30, 2, 2  # Both state and control are 2D
+    batch_size, seq_len, state_dim, control_dim = 2, 30, 2, 10  # state_dim=2 after PCA
     
     x = torch.randn(batch_size, seq_len, state_dim)  # State sequences x(0:T) - PCA processed
-    u = torch.randn(batch_size, seq_len, control_dim)  # Control sequences u(0:T) - 2D control signals
+    u = torch.randn(batch_size, seq_len, control_dim)  # Control sequences u(0:T)
     
     # Training mode (with teacher forcing)
     model.train()
