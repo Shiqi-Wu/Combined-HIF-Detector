@@ -337,9 +337,6 @@ class AcceleratedLSTMTrainer:
         """
         Reset trainer state for a new fold while keeping the same accelerator
         """
-        # Wait for all processes to complete previous fold
-        self.accelerator.wait_for_everyone()
-        
         self.fold_idx = fold_idx
         
         # Setup new logger for this fold
@@ -355,15 +352,12 @@ class AcceleratedLSTMTrainer:
             if self.accelerator.is_main_process:
                 self.logger.info(f"Set random seed to {fold_seed}")
         
-        # Create new model for this fold - ensure same initialization across all processes
+        # Create new model for this fold
         self.model = LSTMClassifier(**self.model_config).to(torch.float64)
         model_params = sum(p.numel() for p in self.model.parameters())
         
         if self.accelerator.is_main_process:
             self.logger.info(f"Created new model with {model_params:,} parameters")
-        
-        # Wait for all processes to complete model creation
-        self.accelerator.wait_for_everyone()
         
         # Create new optimizer for this fold
         self.optimizer = optim.AdamW(
@@ -390,9 +384,6 @@ class AcceleratedLSTMTrainer:
         
         if self.accelerator.is_main_process:
             self.logger.info("Fold reset completed")
-        
-        # Final synchronization
-        self.accelerator.wait_for_everyone()
     
     def create_scheduler(self, optimizer):
         """Create learning rate scheduler (fresh for each fold)"""
@@ -548,9 +539,7 @@ class AcceleratedLSTMTrainer:
     
     def evaluate_model_on_datasets(self, train_dataset, val_dataset, test_dataset):
         """Evaluate model on train, validation, and test datasets"""
-        # Use the unwrapped model for evaluation to avoid device issues
-        model = self.accelerator.unwrap_model(self.model) if hasattr(self, 'accelerator') else self.model
-        model.eval()
+        self.model.eval()
         results = {}
         
         # Evaluate on each dataset
@@ -591,7 +580,7 @@ class AcceleratedLSTMTrainer:
                     # Move targets to the same device as model
                     p_indices = p_indices.to(self.accelerator.device)
                     
-                    outputs = model(x_batch)
+                    outputs = self.model(x_batch)
                     loss = self.criterion(outputs, p_indices)
                     
                     total_loss += loss.item()
