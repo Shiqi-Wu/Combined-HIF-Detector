@@ -274,7 +274,193 @@ class Seq2SeqLSTM(nn.Module):
                 predictions = predictions / temperature
             
             return predictions
-
+    
+    def predict_control(self, 
+                       state_sequences: torch.Tensor,
+                       initial_control: Optional[torch.Tensor] = None,
+                       output_length: Optional[int] = None,
+                       temperature: float = 1.0,
+                       return_full_sequence: bool = True) -> torch.Tensor:
+        """
+        Generate control signals u(t) from state sequences x(t) for real-world usage
+        
+        This function is designed for practical deployment where only state measurements
+        are available and control signals need to be generated in real-time.
+        
+        Args:
+            state_sequences: [batch_size, seq_len, state_dim] - State measurements x(0:T)
+            initial_control: [batch_size, 1, control_dim] - Initial control u(-1), if None uses zeros
+            output_length: Length of control sequence to generate, if None uses state sequence length
+            temperature: Sampling temperature for diversity (1.0 = no change, >1.0 = more diverse)
+            return_full_sequence: If True returns full sequence, if False returns only last control
+            
+        Returns:
+            control_signals: Generated control signals u(0:T) or u(T) based on return_full_sequence
+                           [batch_size, output_length, control_dim] or [batch_size, 1, control_dim]
+        
+        Example:
+            # Real-time control generation
+            model.eval()
+            x_current = torch.tensor(current_state_measurements)  # Shape: [1, window_size, state_dim]
+            u_next = model.predict_control(x_current, return_full_sequence=False)
+            
+            # Batch control generation
+            x_batch = torch.tensor(state_batch)  # Shape: [batch_size, seq_len, state_dim]
+            u_batch = model.predict_control(x_batch)
+        """
+        self.eval()
+        
+        with torch.no_grad():
+            batch_size, seq_len, _ = state_sequences.shape
+            device = state_sequences.device
+            
+            # Set output length
+            if output_length is None:
+                output_length = seq_len
+            
+            # Encode state sequences to get context for each time step
+            encoder_outputs, encoder_hidden = self.encode(state_sequences)
+            
+            # Initialize decoder hidden state from encoder
+            decoder_hidden = self._init_decoder_hidden(encoder_hidden)
+            
+            # Initialize control signal
+            if initial_control is None:
+                previous_control = torch.zeros(batch_size, 1, self.control_dim, device=device)
+            else:
+                previous_control = initial_control
+            
+            # Generate control sequence
+            if return_full_sequence:
+                predictions = torch.zeros(batch_size, output_length, self.control_dim, device=device)
+                
+                for t in range(output_length):
+                    # Get encoder context for time t
+                    if t < seq_len:
+                        encoder_context = encoder_outputs[:, t:t+1, :]
+                    else:
+                        # Use last available context for prediction beyond sequence length
+                        encoder_context = encoder_outputs[:, -1:, :]
+                    
+                    # Generate u(t) from u(t-1) and context
+                    output, decoder_hidden = self.decode_step(
+                        previous_control=previous_control,
+                        encoder_context=encoder_context,
+                        decoder_hidden=decoder_hidden
+                    )
+                    
+                    # Apply temperature scaling if needed
+                    if temperature != 1.0:
+                        output = output / temperature
+                    
+                    predictions[:, t:t+1, :] = output
+                    previous_control = output
+                
+                return predictions
+            
+            else:
+                # Generate only the next control signal (for real-time applications)
+                # Use the last state for context
+                encoder_context = encoder_outputs[:, -1:, :]
+                
+                # Generate final control signal
+                output, _ = self.decode_step(
+                    previous_control=previous_control,
+                    encoder_context=encoder_context,
+                    decoder_hidden=decoder_hidden
+                )
+                
+                # Apply temperature scaling if needed
+                if temperature != 1.0:
+                    output = output / temperature
+                
+                return output
+    
+    def predict_control_realtime(self, 
+                                state_window: torch.Tensor,
+                                previous_control: Optional[torch.Tensor] = None,
+                                temperature: float = 1.0) -> torch.Tensor:
+        """
+        Real-time control prediction for online applications
+        
+        Optimized for single-step prediction with minimal computational overhead.
+        Suitable for real-time control systems where control signals need to be 
+        generated at each time step.
+        
+        Args:
+            state_window: [1, window_size, state_dim] - Recent state measurements
+            previous_control: [1, 1, control_dim] - Previous control signal u(t-1)
+            temperature: Sampling temperature
+            
+        Returns:
+            next_control: [1, 1, control_dim] - Next control signal u(t)
+        
+        Example:
+            # In a real-time control loop
+            for t in range(control_horizon):
+                # Get current state window
+                state_window = get_recent_states(window_size)  # [1, window_size, state_dim]
+                
+                # Generate next control
+                u_next = model.predict_control_realtime(state_window, u_prev)
+                
+                # Apply control and get feedback
+                apply_control(u_next)
+                u_prev = u_next
+        """
+        assert state_window.size(0) == 1, "Real-time prediction supports batch_size=1 only"
+        
+        return self.predict_control(
+            state_sequences=state_window,
+            initial_control=previous_control,
+            return_full_sequence=False,
+            temperature=temperature
+        )
+    
+    def predict_control_sequence(self, 
+                                state_sequence: torch.Tensor,
+                                control_horizon: int,
+                                initial_control: Optional[torch.Tensor] = None,
+                                temperature: float = 1.0) -> torch.Tensor:
+        """
+        Generate control sequence for Model Predictive Control (MPC) applications
+        
+        Generates a sequence of control signals for a given prediction horizon,
+        useful for MPC where future control actions need to be planned.
+        
+        Args:
+            state_sequence: [1, seq_len, state_dim] - State measurements
+            control_horizon: Number of future control steps to predict
+            initial_control: [1, 1, control_dim] - Initial control signal
+            temperature: Sampling temperature
+            
+        Returns:
+            control_sequence: [1, control_horizon, control_dim] - Predicted control sequence
+        
+        Example:
+            # For MPC application
+            state_history = get_state_history()  # [1, window_size, state_dim]
+            prediction_horizon = 10
+            
+            # Generate control sequence for MPC
+            u_sequence = model.predict_control_sequence(
+                state_sequence=state_history,
+                control_horizon=prediction_horizon
+            )
+            
+            # Use first control action and re-plan at next time step
+            u_current = u_sequence[:, 0:1, :]
+        """
+        assert state_sequence.size(0) == 1, "MPC prediction supports batch_size=1 only"
+        
+        return self.predict_control(
+            state_sequences=state_sequence,
+            initial_control=initial_control,
+            output_length=control_horizon,
+            temperature=temperature,
+            return_full_sequence=True
+        )
+    
 
 class AttentionMechanism(nn.Module):
     """
@@ -458,3 +644,119 @@ if __name__ == "__main__":
     print(f"2. At time t, decoder uses u(t-1) and context from x(0:t)")
     print(f"3. Output: u(t) = f(u(t-1), context_from_x(0:t))")
     print(f"4. This naturally captures the dependency u(t) on x(0:t) and u(0:t-1)")
+    
+    # Test practical inference functions
+    print(f"\n" + "="*60)
+    print("PRACTICAL INFERENCE FUNCTIONS DEMONSTRATION")
+    print("="*60)
+    
+    # Test 1: Full sequence prediction from states only
+    print(f"\n1. Full Control Sequence Prediction:")
+    x_test = torch.randn(1, seq_len, state_dim)  # Single sample for testing
+    u_predicted = model.predict_control(x_test)
+    print(f"   Input states x(0:T): {x_test.shape}")
+    print(f"   Predicted controls u(0:T): {u_predicted.shape}")
+    
+    # Test 2: Real-time single-step prediction
+    print(f"\n2. Real-time Control Prediction:")
+    state_window = torch.randn(1, 10, state_dim)  # Recent 10 time steps
+    u_prev = torch.randn(1, 1, control_dim)  # Previous control
+    u_next = model.predict_control_realtime(state_window, u_prev)
+    print(f"   State window: {state_window.shape}")
+    print(f"   Previous control: {u_prev.shape}")
+    print(f"   Next control: {u_next.shape}")
+    
+    # Test 3: MPC-style sequence prediction
+    print(f"\n3. Model Predictive Control (MPC) Prediction:")
+    state_history = torch.randn(1, 15, state_dim)  # Recent state history
+    control_horizon = 5  # Predict next 5 control steps
+    u_mpc = model.predict_control_sequence(state_history, control_horizon)
+    print(f"   State history: {state_history.shape}")
+    print(f"   Control horizon: {control_horizon}")
+    print(f"   MPC control sequence: {u_mpc.shape}")
+    
+    # Test 4: Batch prediction for multiple scenarios
+    print(f"\n4. Batch Control Prediction:")
+    x_batch = torch.randn(4, seq_len, state_dim)  # Multiple scenarios
+    u_batch = model.predict_control(x_batch)
+    print(f"   Input batch states: {x_batch.shape}")
+    print(f"   Predicted batch controls: {u_batch.shape}")
+    
+    print(f"\n" + "="*60)
+    print("USAGE EXAMPLES FOR REAL APPLICATIONS")
+    print("="*60)
+    
+    print("""
+# Example 1: Real-time Control System
+model.eval()
+state_buffer = deque(maxlen=window_size)  # Rolling state buffer
+u_prev = torch.zeros(1, 1, control_dim)   # Initialize control
+
+for t in range(simulation_steps):
+    # Get current state measurement
+    current_state = get_sensor_measurements()  # Shape: [state_dim]
+    state_buffer.append(current_state)
+    
+    if len(state_buffer) == window_size:
+        # Convert to tensor
+        state_window = torch.tensor(list(state_buffer)).unsqueeze(0)  # [1, window_size, state_dim]
+        
+        # Generate next control
+        u_next = model.predict_control_realtime(state_window, u_prev)
+        
+        # Apply control to system
+        apply_control_to_system(u_next.squeeze().numpy())
+        u_prev = u_next
+
+# Example 2: Model Predictive Control (MPC)
+def mpc_controller(model, state_history, prediction_horizon=10):
+    model.eval()
+    
+    # Generate control sequence for entire horizon
+    u_sequence = model.predict_control_sequence(
+        state_sequence=state_history,
+        control_horizon=prediction_horizon
+    )
+    
+    # Apply only the first control action (receding horizon)
+    u_current = u_sequence[:, 0:1, :]
+    return u_current, u_sequence
+
+# Example 3: Batch Processing for Simulation Studies
+def batch_simulation(model, state_trajectories):
+    model.eval()
+    
+    # Generate controls for all trajectories at once
+    control_trajectories = model.predict_control(state_trajectories)
+    
+    return control_trajectories
+
+# Example 4: Online Learning with Feedback
+def adaptive_control(model, state_window, target_trajectory, learning_rate=0.01):
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Generate control
+    u_pred = model.predict_control_realtime(state_window)
+    
+    # Get actual system response and compute error
+    actual_response = apply_and_measure(u_pred)
+    target_response = target_trajectory
+    loss = torch.mse_loss(actual_response, target_response)
+    
+    # Update model
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    return u_pred
+    """)
+    
+    print(f"\nKey Features of Practical Inference Functions:")
+    print(f"✓ predict_control(): General-purpose control generation from states")
+    print(f"✓ predict_control_realtime(): Optimized for real-time single-step prediction")
+    print(f"✓ predict_control_sequence(): Designed for MPC applications")
+    print(f"✓ Temperature control for output diversity")
+    print(f"✓ Flexible output length and initial conditions")
+    print(f"✓ Batch processing support")
+    print(f"✓ No requirement for ground-truth control sequences during inference")

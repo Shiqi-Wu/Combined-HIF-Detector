@@ -119,7 +119,7 @@ class LSTMEvaluator:
             self.datasets['folds'].append({
                 'train': train_loader_scaled.dataset,
                 'val': val_loader_scaled.dataset,
-                'fold_idx': fold_idx
+                'fold_idx': fold_idx,
             })
         
         print(f"Data loading completed for {len(self.datasets['folds'])} folds")
