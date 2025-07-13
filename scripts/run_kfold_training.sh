@@ -44,7 +44,7 @@ EXPERIMENT_NAME="kfold_lstm_$(date +%Y%m%d_%H%M%S)"
 RESULTS_DIR="./results/results_kfold_1gpu_8192"
 
 # Accelerate configuration
-ACCELERATE_CONFIG_FILE="./accelerate_kfold_config.yaml"
+ACCELERATE_CONFIG_FILE="./configs/accelerate_kfold_config.yaml"
 
 # Script path
 SCRIPT_PATH="./src/trainers/distributed_trainer.py"
