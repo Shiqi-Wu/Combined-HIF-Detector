@@ -19,10 +19,13 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, List, Tuple, Optional
+from collections import defaultdict, Counter
+
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 
 # Add parent directories to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -189,7 +192,7 @@ class LSTMEvaluator:
         
         return model, checkpoint_info
     
-    def evaluate_model_on_dataset(self, model: nn.Module, dataset, batch_size: int = 32) -> Dict[str, float]:
+    def evaluate_model_on_dataset(self, model: nn.Module, dataset, batch_size: int = 32, trajectory_level: bool = False) -> Dict[str, float]:
         """
         Evaluate a single model on a dataset
         
@@ -209,7 +212,12 @@ class LSTMEvaluator:
         total_loss = 0
         total_correct = 0
         total_samples = 0
-        
+
+        global_sample_index = 0
+        trajectory_predictions = defaultdict(list)
+        trajectory_labels = {}
+        subset_indices = getattr(dataset, "indices", None)
+
         with torch.no_grad():
             for batch in dataloader:
                 x_batch, u_batch, p_batch = batch
@@ -230,9 +238,44 @@ class LSTMEvaluator:
                 _, predicted = torch.max(outputs.data, 1)
                 total_samples += p_indices.size(0)
                 total_correct += (predicted == p_indices).sum().item()
+
+                if trajectory_level:
+                    for i in range(len(p_indices)):
+                        if hasattr(dataset, "get_file_index_for_sample"):
+                            if subset_indices is not None:
+                                global_idx = subset_indices[global_sample_index]
+                            else:
+                                global_idx = global_sample_index
+                        traj_id = dataset.get_file_index_for_sample(global_idx)
+                        trajectory_predictions[traj_id].append(predicted[i].item())
+                        trajectory_labels[traj_id] = p_indices[i].item()
+                        global_sample_index += 1
+
+                avg_loss = total_loss / len(dataloader)
+                accuracy = total_correct / total_samples
+
+                if trajectory_level:
+                    print(f"[DEBUG]Total trajectories found: {len(trajectory_predictions)}")
+                    print("[DEBUG]Sample trajectory lengths:")
+                    for traj_id, preds in list(trajectory_predictions.items())[:5]:
+                        print(f"  {traj_id}: {len(preds)} predictions")
+                    correct_trajectories = 0
+                    for traj_id, preds in trajectory_predictions.items():
+                        majority_vote = Counter(preds).most_common(1)[0][0]
+                        if majority_vote == trajectory_labels[traj_id]:
+                            correct_trajectories += 1
+                    traj_acc = correct_trajectories / len(trajectory_labels)
+                    return {
+                    'loss': avg_loss,
+                    'accuracy': accuracy,  # sample-level
+                    'trajectory_accuracy': traj_acc,
+                    'total_samples': total_samples,
+                    'total_trajectories': len(trajectory_labels),
+                    }
+
+
         
-        avg_loss = total_loss / len(dataloader)
-        accuracy = total_correct / total_samples
+
         
         return {
             'loss': avg_loss,
@@ -241,7 +284,7 @@ class LSTMEvaluator:
         }
     
     
-    def evaluate_all_models(self, model_config: Dict, batch_size: int = 32, save_csv: Optional[str] = None) -> None:
+    def evaluate_all_models(self, model_config: Dict, batch_size: int = 32, save_csv: Optional[str] = None, trajectory_level: bool = False) -> None:
         """
         Evaluate all models sequentially (one at a time to save memory)
         
@@ -275,15 +318,15 @@ class LSTMEvaluator:
             results = {}
             
             # Train set
-            results['train'] = self.evaluate_model_on_dataset(model, fold_data['train'], batch_size)
+            results['train'] = self.evaluate_model_on_dataset(model, fold_data['train'], batch_size, trajectory_level)
             print(f"  Train - Loss: {results['train']['loss']:.4f}, Acc: {results['train']['accuracy']:.4f}")
             
             # Validation set
-            results['val'] = self.evaluate_model_on_dataset(model, fold_data['val'], batch_size)
+            results['val'] = self.evaluate_model_on_dataset(model, fold_data['val'], batch_size, trajectory_level)
             print(f"  Val   - Loss: {results['val']['loss']:.4f}, Acc: {results['val']['accuracy']:.4f}")
             
             # Test set
-            results['test'] = self.evaluate_model_on_dataset(model, self.datasets['test'], batch_size)
+            results['test'] = self.evaluate_model_on_dataset(model, self.datasets['test'], batch_size, trajectory_level)
             print(f"  Test  - Loss: {results['test']['loss']:.4f}, Acc: {results['test']['accuracy']:.4f}")
             
             # Store results
@@ -392,88 +435,101 @@ class LSTMEvaluator:
     def plot_evaluation_boxplots(self, save_dir: Optional[str] = None) -> None:
         """
         Plot boxplots of model evaluation results across folds
-        
+
         Args:
             save_dir: Directory to save plots (optional)
         """
         print("\n===== Plotting Evaluation Boxplots =====")
-        
+
         if not self.evaluation_results:
             print("No evaluation results available")
             return
-        
-        # Prepare data for boxplots
-        data_for_plotting = []
-        
+
+        # Prepare data
+        sample_data = []
+        traj_data = []
+        has_traj = False
+
         for fold_num, results in self.evaluation_results.items():
             for dataset_name in ['train', 'val', 'test']:
-                data_for_plotting.append({
+                result = results[dataset_name]
+                dataset_label = dataset_name.capitalize()
+                sample_data.append({
                     'Fold': fold_num,
-                    'Dataset': dataset_name.capitalize(),
-                    'Loss': results[dataset_name]['loss'],
-                    'Accuracy': results[dataset_name]['accuracy']
+                    'Dataset': dataset_label,
+                    'Loss': result['loss'],
+                    'Accuracy': result['accuracy']
                 })
-        
-        df = pd.DataFrame(data_for_plotting)
-        
-        # Create figure with subplots
+                if 'trajectory_accuracy' in result:
+                    has_traj = True
+                    traj_data.append({
+                        'Fold': fold_num,
+                        'Dataset': dataset_label,
+                        'Loss': result['loss'],
+                        'Trajectory Accuracy': result['trajectory_accuracy']
+                    })
+
+        df_sample = pd.DataFrame(sample_data)
+
+        # ----- Sample-Level Plot -----
         fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-        fig.suptitle('Model Evaluation Results Across All Folds', fontsize=16)
-        
-        # Loss boxplot
-        sns.boxplot(data=df, x='Dataset', y='Loss', ax=axes[0])
+        fig.suptitle('Sample-Level Evaluation Results', fontsize=16)
+
+        sns.boxplot(data=df_sample, x='Dataset', y='Loss', ax=axes[0])
         axes[0].set_title('Loss Distribution')
         axes[0].set_ylabel('Loss')
         axes[0].grid(True, alpha=0.3)
-        
-        # Add individual points
-        sns.stripplot(data=df, x='Dataset', y='Loss', ax=axes[0], 
-                     color='red', alpha=0.7, size=8)
-        
-        # Accuracy boxplot
-        sns.boxplot(data=df, x='Dataset', y='Accuracy', ax=axes[1])
-        axes[1].set_title('Accuracy Distribution')
+        sns.stripplot(data=df_sample, x='Dataset', y='Loss', ax=axes[0],
+                  color='red', alpha=0.7, size=8)
+
+        sns.boxplot(data=df_sample, x='Dataset', y='Accuracy', ax=axes[1])
+        axes[1].set_title('Sample-Level Accuracy Distribution')
         axes[1].set_ylabel('Accuracy')
         axes[1].grid(True, alpha=0.3)
-        
-        # Add individual points
-        sns.stripplot(data=df, x='Dataset', y='Accuracy', ax=axes[1], 
-                     color='red', alpha=0.7, size=8)
-        
+        sns.stripplot(data=df_sample, x='Dataset', y='Accuracy', ax=axes[1],
+                  color='red', alpha=0.7, size=8)
+
         plt.tight_layout()
-        
-        # Save plot if requested
         if save_dir:
-            save_path = Path(save_dir) / 'evaluation_boxplots.png'
+            save_path = Path(save_dir) / 'evaluation_boxplots_sample.png'
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Evaluation boxplots saved to {save_path}")
-        
+            print(f"Sample-level boxplots saved to {save_path}")
         plt.show()
-        
-        # Print summary statistics
-        print("\nEvaluation Results Summary:")
-        summary_stats = df.groupby('Dataset').agg({
-            'Loss': ['mean', 'std', 'min', 'max'],
-            'Accuracy': ['mean', 'std', 'min', 'max']
-        }).round(4)
-        
-        print(summary_stats)
-        
-        # Save summary to CSV
-        if save_dir:
-            summary_path = Path(save_dir) / 'evaluation_summary.csv'
-            summary_stats.to_csv(summary_path)
-            print(f"Evaluation summary saved to {summary_path}")
-        
-        # Create detailed results table
-        detailed_results = df.pivot(index='Fold', columns='Dataset', values=['Loss', 'Accuracy'])
-        print("\nDetailed Results by Fold:")
-        print(detailed_results.round(4))
-        
-        if save_dir:
-            detailed_path = Path(save_dir) / 'detailed_results.csv'
-            detailed_results.to_csv(detailed_path)
-            print(f"Detailed results saved to {detailed_path}")
+
+        # ----- Trajectory-Level Plot -----
+        if has_traj:
+            df_traj = pd.DataFrame(traj_data)
+
+            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+            fig.suptitle('Trajectory-Level Accuracy Results', fontsize=16)
+
+            sns.boxplot(data=df_traj, x='Dataset', y='Trajectory Accuracy', ax=ax)
+            ax.set_title('Trajectory-Level Accuracy Distribution')
+            ax.set_ylabel('Trajectory Accuracy')
+            ax.grid(True, alpha=0.3)
+            sns.stripplot(data=df_traj, x='Dataset', y='Trajectory Accuracy', ax=ax,
+                      color='blue', alpha=0.7, size=8)
+
+            plt.tight_layout()
+            if save_dir:
+                save_path = Path(save_dir) / 'evaluation_boxplots_trajectory.png'
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"Trajectory-level boxplots saved to {save_path}")
+            plt.show()
+
+        # ----- Print Summary -----
+        print("\nEvaluation Summary (Sample-Level):")
+        print(df_sample.groupby('Dataset').agg({
+            'Loss': ['mean', 'std'],
+            'Accuracy': ['mean', 'std']
+        }).round(4))
+
+        if has_traj:
+            print("\nEvaluation Summary (Trajectory-Level):")
+            print(df_traj.groupby('Dataset').agg({
+                'Trajectory Accuracy': ['mean', 'std']
+            }).round(4))
+
     
     def save_evaluation_results(self, save_dir: str) -> None:
         """
@@ -539,7 +595,9 @@ class LSTMEvaluator:
     
     def run_full_evaluation(self, model_config: Dict, data_config: Dict, 
                            k_folds: int = 5, random_state: int = 42, 
-                           save_dir: Optional[str] = None) -> None:
+                           save_dir: Optional[str] = None,
+                           trajectory_level: bool = False,
+                           ) -> None:
         """
         Run complete evaluation pipeline
         
@@ -568,7 +626,7 @@ class LSTMEvaluator:
         csv_path = None
         if save_dir:
             csv_path = str(Path(save_dir) / 'fold_evaluation_results.csv')
-        self.evaluate_all_models(model_config, data_config.get('batch_size', 32), csv_path)
+        self.evaluate_all_models(model_config, data_config.get('batch_size', 32), csv_path, trajectory_level)
         
         # Step 4: Plot training histories
         self.plot_training_histories(save_dir)
@@ -615,6 +673,8 @@ def main():
                        help='Sampling step')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size for evaluation')
+    parser.add_argument('--trajectory_level', action='store_true', default=True,
+                       help='Use trajectory level eval')
     
     # Model parameters
     parser.add_argument('--hidden_size', type=int, default=128,
@@ -625,6 +685,8 @@ def main():
                        help='Dropout rate')
     parser.add_argument('--bidirectional', action='store_true', default=True,
                        help='Use bidirectional LSTM')
+
+    
     
     args = parser.parse_args()
     
@@ -662,12 +724,13 @@ def main():
         data_config=data_config,
         k_folds=args.k_folds,
         random_state=args.random_state,
-        save_dir=save_dir
+        save_dir=save_dir,
+        trajectory_level=args.trajectory_level,
     )
     
     # Save to specific CSV file if requested
-    if args.csv_file:
-        evaluator._save_evaluation_to_csv(args.csv_file)
+    # if args.csv_file:
+    #     evaluator._save_evaluation_to_csv(args.csv_file)
 
 
 if __name__ == "__main__":
