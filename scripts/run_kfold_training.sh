@@ -12,8 +12,8 @@ set -e  # Exit on any error
 # Data parameters
 DATA_DIR="data"
 SAMPLE_STEP=1
-WINDOW_SIZE=30
-BATCH_SIZE=8192  # Per device batch size
+WINDOW_SIZE=1000
+BATCH_SIZE=20  # Per device batch size
 PCA_DIM=2
 
 # Model parameters
@@ -41,7 +41,7 @@ WANDB_ENTITY=""
 EXPERIMENT_NAME="kfold_lstm_$(date +%Y%m%d_%H%M%S)"
 
 # Output parameters
-RESULTS_DIR="./results/results_kfold_1gpu_8192"
+RESULTS_DIR="./results/results_kfold_2gpu_8192_1000"
 
 # Accelerate configuration
 ACCELERATE_CONFIG_FILE="./configs/accelerate_kfold_config.yaml"

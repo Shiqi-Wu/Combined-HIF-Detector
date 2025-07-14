@@ -120,14 +120,13 @@ def compute_K_and_B_per_class(x_dataset, u_dataset, et_dataset, shared_K=True):
         # Compute residual and estimate B
         delta_Y = Y_i - X_i @ K_i
         try:
-            B_T, _, _, _ = np.linalg.lstsq(U_i, delta_Y, rcond=None)
-            B = B_T.T
+            B, _, _, _ = np.linalg.lstsq(U_i, delta_Y, rcond=None)
         except np.linalg.LinAlgError:
             # Fallback to zero matrix
             B = np.zeros((X_i.shape[1], U_i.shape[1]))
 
         # Compute prediction error
-        Y_pred = X_i @ K_i + U_i @ B.T
+        Y_pred = X_i @ K_i + U_i @ B
         mse = np.mean((Y_i - Y_pred) ** 2)
 
         B_list.append(B)

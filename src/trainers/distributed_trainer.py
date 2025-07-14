@@ -253,8 +253,13 @@ class AcceleratedLSTMTrainer:
             # Add fold_idx to seed to ensure different initialization for each fold
             fold_seed = train_config['seed'] + (fold_idx if fold_idx is not None else 0)
             set_seed(fold_seed)
+            # Ensure all processes have the same seed before proceeding
+            self.accelerator.wait_for_everyone()
             if self.accelerator.is_main_process:
                 self.logger.info(f"Set random seed to {fold_seed}")
+        
+        # Ensure all processes are synchronized before model creation
+        self.accelerator.wait_for_everyone()
         
         # Initialize wandb only once per accelerator (not per fold)
         if (self.accelerator.is_main_process and 
@@ -273,10 +278,34 @@ class AcceleratedLSTMTrainer:
             self.use_wandb = False
             self.logger.info("WandB logging disabled")
         
-        # Create model (fresh for each fold)
-        self.model = LSTMClassifier(**model_config).to(torch.float64)
+        # Create model (fresh for each fold) - ensure consistent initialization across all processes
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Creating model with config: {model_config}")
+        
+        self.model = LSTMClassifier(**model_config)
+        
+        # Log model structure for debugging
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Model created successfully")
+            self.logger.info(f"Model type: {type(self.model)}")
+            param_count = sum(p.numel() for p in self.model.parameters())
+            self.logger.info(f"Total parameters before float64 conversion: {param_count}")
+        
+        # Ensure consistent model initialization across all processes
+        self.accelerator.wait_for_everyone()
+        
+        # Convert to float64 after ensuring consistency
+        self.model = self.model.to(torch.float64)
+        
         model_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        
+        # Log detailed parameter information
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Model parameters after float64 conversion: {model_params}")
+            self.logger.info(f"Trainable parameters: {trainable_params}")
+            self.logger.info(f"Model device: {next(self.model.parameters()).device}")
+            self.logger.info(f"Model dtype: {next(self.model.parameters()).dtype}")
         
         if self.accelerator.is_main_process:
             self.logger.info(f"Model created with {model_params:,} parameters ({trainable_params:,} trainable)")
@@ -349,14 +378,39 @@ class AcceleratedLSTMTrainer:
         if self.train_config.get('seed'):
             fold_seed = self.train_config['seed'] + fold_idx
             set_seed(fold_seed)
+            # Ensure all processes have the same seed before proceeding
+            self.accelerator.wait_for_everyone()
             if self.accelerator.is_main_process:
                 self.logger.info(f"Set random seed to {fold_seed}")
         
-        # Create new model for this fold
-        self.model = LSTMClassifier(**self.model_config).to(torch.float64)
+        # Ensure all processes are synchronized before model creation
+        self.accelerator.wait_for_everyone()
+        
+        # Create new model for this fold - ensure consistent initialization
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Creating new model for fold {fold_idx + 1} with config: {self.model_config}")
+        
+        self.model = LSTMClassifier(**self.model_config)
+        
+        # Log model structure for debugging
+        if self.accelerator.is_main_process:
+            self.logger.info(f"Model created successfully for fold {fold_idx + 1}")
+            param_count = sum(p.numel() for p in self.model.parameters())
+            self.logger.info(f"Total parameters before float64 conversion: {param_count}")
+        
+        # Ensure consistent model initialization across all processes
+        self.accelerator.wait_for_everyone()
+        
+        # Convert to float64 after ensuring consistency
+        self.model = self.model.to(torch.float64)
+        
         model_params = sum(p.numel() for p in self.model.parameters())
         
+        # Log detailed parameter information
         if self.accelerator.is_main_process:
+            self.logger.info(f"Model parameters after float64 conversion: {model_params}")
+            self.logger.info(f"Model device: {next(self.model.parameters()).device}")
+            self.logger.info(f"Model dtype: {next(self.model.parameters()).dtype}")
             self.logger.info(f"Created new model with {model_params:,} parameters")
         
         # Create new optimizer for this fold
@@ -402,6 +456,20 @@ class AcceleratedLSTMTrainer:
             self.logger.info(f"  Train dataset size: {len(train_dataset)}")
             self.logger.info(f"  Validation dataset size: {len(val_dataset)}")
             self.logger.info(f"  Batch size: {self.train_config['batch_size']}")
+            
+            # Test dataset access
+            try:
+                sample = train_dataset[0]
+                self.logger.info(f"  Train sample format: {type(sample)}")
+                if isinstance(sample, (tuple, list)):
+                    self.logger.info(f"  Train sample length: {len(sample)}")
+                    for i, item in enumerate(sample):
+                        if hasattr(item, 'shape'):
+                            self.logger.info(f"    Item {i} shape: {item.shape}")
+                        else:
+                            self.logger.info(f"    Item {i} type: {type(item)}")
+            except Exception as e:
+                self.logger.error(f"  Error accessing train dataset sample: {e}")
         
         train_loader = DataLoader(
             train_dataset,
@@ -423,6 +491,20 @@ class AcceleratedLSTMTrainer:
         if self.accelerator.is_main_process:
             self.logger.info(f"  Train batches: {len(train_loader)}")
             self.logger.info(f"  Validation batches: {len(val_loader)}")
+            
+            # Test data loader access
+            try:
+                batch = next(iter(train_loader))
+                self.logger.info(f"  First batch type: {type(batch)}")
+                if isinstance(batch, (tuple, list)):
+                    self.logger.info(f"  First batch length: {len(batch)}")
+                    for i, item in enumerate(batch):
+                        if hasattr(item, 'shape'):
+                            self.logger.info(f"    Batch item {i} shape: {item.shape}")
+                        else:
+                            self.logger.info(f"    Batch item {i} type: {type(item)}")
+            except Exception as e:
+                self.logger.error(f"  Error accessing train loader batch: {e}")
         
         return train_loader, val_loader
     
@@ -441,7 +523,25 @@ class AcceleratedLSTMTrainer:
             progress_bar = train_loader
         
         for batch_idx, batch in enumerate(progress_bar):
-            x_batch, u_batch, p_batch = batch
+            # Debug batch content
+            if batch is None:
+                if self.accelerator.is_main_process:
+                    self.logger.error(f"Received None batch at index {batch_idx}")
+                continue
+            
+            # Check if batch is a tuple/list with expected length
+            if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+                if self.accelerator.is_main_process:
+                    self.logger.error(f"Unexpected batch format at index {batch_idx}: {type(batch)}, length: {len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+                continue
+                
+            try:
+                x_batch, u_batch, p_batch = batch
+            except Exception as e:
+                if self.accelerator.is_main_process:
+                    self.logger.error(f"Failed to unpack batch at index {batch_idx}: {e}")
+                continue
+            
             x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
             u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
             
@@ -492,13 +592,23 @@ class AcceleratedLSTMTrainer:
                 })
         
         # Calculate metrics
-        avg_loss = total_loss / len(train_loader)
-        accuracy = total_correct / total_samples
+        if len(train_loader) > 0:
+            avg_loss = total_loss / len(train_loader)
+        else:
+            avg_loss = float('inf')
+            
+        if total_samples > 0:
+            accuracy = total_correct / total_samples
+        else:
+            accuracy = 0.0
         
         # Calculate throughput
         epoch_time = time.time() - start_time
-        samples_per_sec = total_samples / epoch_time
-        self.performance_metrics['throughput'].append(samples_per_sec)
+        if epoch_time > 0 and total_samples > 0:
+            samples_per_sec = total_samples / epoch_time
+            self.performance_metrics['throughput'].append(samples_per_sec)
+        else:
+            self.performance_metrics['throughput'].append(0.0)
         
         return avg_loss, accuracy
     
@@ -511,7 +621,19 @@ class AcceleratedLSTMTrainer:
         
         with torch.no_grad():
             for batch in val_loader:
-                x_batch, u_batch, p_batch = batch
+                # Debug batch content
+                if batch is None:
+                    continue
+                
+                # Check if batch is a tuple/list with expected length
+                if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+                    continue
+                    
+                try:
+                    x_batch, u_batch, p_batch = batch
+                except Exception as e:
+                    continue
+                
                 x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
                 u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
                 
@@ -532,8 +654,15 @@ class AcceleratedLSTMTrainer:
                 total_samples += p_indices.size(0)
                 total_correct += (predicted == p_indices).sum().item()
         
-        avg_loss = total_loss / len(val_loader)
-        accuracy = total_correct / total_samples
+        if len(val_loader) > 0:
+            avg_loss = total_loss / len(val_loader)
+        else:
+            avg_loss = float('inf')
+            
+        if total_samples > 0:
+            accuracy = total_correct / total_samples
+        else:
+            accuracy = 0.0
         
         return avg_loss, accuracy
     
@@ -567,7 +696,18 @@ class AcceleratedLSTMTrainer:
                 total_samples = 0
                 
                 for batch in eval_loader:
-                    x_batch, u_batch, p_batch = batch
+                    # Debug batch content
+                    if batch is None:
+                        continue
+                    
+                    # Check if batch is a tuple/list with expected length
+                    if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+                        continue
+                        
+                    try:
+                        x_batch, u_batch, p_batch = batch
+                    except Exception as e:
+                        continue
                     x_batch = x_batch.to(torch.float64).to(self.accelerator.device)
                     u_batch = u_batch.to(torch.float64).to(self.accelerator.device)
                     
@@ -588,8 +728,15 @@ class AcceleratedLSTMTrainer:
                     total_samples += p_indices.size(0)
                     total_correct += (predicted == p_indices).sum().item()
                 
-                avg_loss = total_loss / len(eval_loader)
-                accuracy = total_correct / total_samples
+                if len(eval_loader) > 0:
+                    avg_loss = total_loss / len(eval_loader)
+                else:
+                    avg_loss = float('inf')
+                    
+                if total_samples > 0:
+                    accuracy = total_correct / total_samples
+                else:
+                    accuracy = 0.0
                 
                 results[dataset_name] = {
                     'loss': avg_loss,
@@ -738,11 +885,25 @@ class AcceleratedLSTMTrainer:
         # Create scheduler (fresh for each fold)
         self.scheduler = self.create_scheduler(self.optimizer)
         
+        # Ensure all processes are synchronized before preparing with accelerator
+        self.accelerator.wait_for_everyone()
+        
+        # Log model info before preparation on all processes
+        model_params = sum(p.numel() for p in self.model.parameters())
+        self.logger.info(f"Process {self.accelerator.process_index}: Model has {model_params} parameters before preparation")
+        
+        # Another synchronization point
+        self.accelerator.wait_for_everyone()
+        
         # Prepare everything with accelerator
         # Note: This creates new distributed wrappers for each fold
         self.model, self.optimizer, train_loader, val_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, train_loader, val_loader, self.scheduler
         )
+        
+        # Verify model consistency after preparation on all processes
+        prepared_params = sum(p.numel() for p in self.model.parameters())
+        self.logger.info(f"Process {self.accelerator.process_index}: Model has {prepared_params} parameters after preparation")
         
         if self.accelerator.is_main_process:
             self.logger.info("Model and optimizers prepared with accelerator")

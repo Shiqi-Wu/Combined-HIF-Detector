@@ -92,13 +92,15 @@ class LSTMClassifier(nn.Module):
         h0 = torch.zeros(
             self.num_layers * (2 if self.bidirectional else 1),
             batch_size,
-            self.hidden_size
+            self.hidden_size,
+            dtype=x.dtype
         ).to(x.device)
         
         c0 = torch.zeros(
             self.num_layers * (2 if self.bidirectional else 1),
             batch_size,
-            self.hidden_size
+            self.hidden_size,
+            dtype=x.dtype
         ).to(x.device)
         
         # LSTM forward pass
