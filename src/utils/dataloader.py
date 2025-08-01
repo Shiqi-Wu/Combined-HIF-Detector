@@ -54,8 +54,8 @@ def load_dataset_from_folder(data_dir, config, test_size=0.2, random_state=42, d
                 data_dict = np.load(data_file_path, allow_pickle=True).item()
                 
                 # Extract signal data
-                x_data = data_dict['signals'][:, :-6]  # State signals
-                u_data = data_dict['signals'][:, -6:-4]  # Control signals
+                x_data = data_dict['signals'][1000:, :-6]  # State signals
+                u_data = data_dict['signals'][1000:, -6:-4]  # Control signals
                 
                 # Apply column deletion
                 x_data = np.delete(x_data, delete_columns, axis=1)
@@ -100,24 +100,7 @@ def load_dataset_from_folder(data_dir, config, test_size=0.2, random_state=42, d
     train_dataset = NonOverlappingTrajectoryDataset(x_train, u_train, p_train, window_size)
     test_dataset = NonOverlappingTrajectoryDataset(x_test, u_test, p_test, window_size)
     
-    # Create DataLoaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=0  # Set to 0 to avoid multiprocessing issues
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=0
-    )
-    
-    print(f"Training samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
-    
-    return train_loader, test_loader
+    return train_dataset, test_dataset
 
 class NonOverlappingTrajectoryDataset(Dataset):
     """Trajectory dataset using non-overlapping windows (backward compatibility)"""
@@ -158,294 +141,6 @@ class NonOverlappingTrajectoryDataset(Dataset):
     def get_file_index_for_sample(self, sample_idx):
         """Get the file index for a specific sample"""
         return self.file_indices[sample_idx]
-
-
-class FileTrackingTrajectoryDataset(Dataset):
-    """Trajectory dataset that tracks which file each sample comes from"""
-    
-    def __init__(self, x_trajectories, u_trajectories, p_labels, file_names, window_size):
-        self.x_samples = []
-        self.u_samples = []
-        self.p_labels = []
-        self.file_indices = []  # Track which file each sample comes from
-        
-        for file_idx, (x_traj, u_traj, p_label, file_name) in enumerate(zip(x_trajectories, u_trajectories, p_labels, file_names)):
-            # Use non-overlapping window splitting
-            x_slices = non_overlapping_window_split(x_traj, window_size)
-            u_slices = non_overlapping_window_split(u_traj, window_size)
-            
-            # Ensure x and u have the same number of slices
-            min_slices = min(len(x_slices), len(u_slices))
-            
-            self.x_samples.extend(x_slices[:min_slices])
-            self.u_samples.extend(u_slices[:min_slices])
-            self.p_labels.extend([p_label] * min_slices)
-            self.file_indices.extend([file_idx] * min_slices)  # Track file origin
-    
-    def __len__(self):
-        return len(self.x_samples)
-    
-    def __getitem__(self, idx):
-        x_sample = torch.FloatTensor(self.x_samples[idx])
-        u_sample = torch.FloatTensor(self.u_samples[idx])
-        p_label = torch.FloatTensor(self.p_labels[idx])
-        
-        return x_sample, u_sample, p_label
-    
-    def get_samples_by_file(self, file_idx):
-        """Get all sample indices that belong to a specific file"""
-        return [i for i, f_idx in enumerate(self.file_indices) if f_idx == file_idx]
-    
-    def get_file_index_for_sample(self, sample_idx):
-        """Get the file index for a specific sample"""
-        return self.file_indices[sample_idx]
-
-def load_full_dataset(data_dir, config, delete_columns=[9, 21, 25, 39, 63]):
-    """
-    Load complete dataset for k-fold cross validation
-    
-    Args:
-        data_dir: Data folder path
-        config: Configuration dictionary
-    
-    Returns:
-        dataset: Complete dataset for k-fold splitting
-        file_labels: Labels for stratified splitting
-        file_to_samples_mapping: Mapping from file index to sample indices
-    """
-    x_trajectories = []
-    u_trajectories = []
-    p_labels = []
-    file_labels = []  # For stratified k-fold
-    file_names = []   # Track original file names
-    min_val = 2
-    max_val = 7
-    
-    print(f"Loading complete dataset from folder {data_dir}...")
-    
-    # Sort files for consistent ordering
-    file_list = sorted([item for item in os.listdir(data_dir) if item.endswith('.npy')])
-    
-    # Iterate through all npy files in the folder
-    for item in file_list:
-        data_file_path = os.path.join(data_dir, item)
-        
-        if os.path.exists(data_file_path):
-            try:
-                data_dict = np.load(data_file_path, allow_pickle=True).item()
-                
-                # Extract signal data
-                x_data = data_dict['signals'][:, :-6]  # State signals
-                u_data = data_dict['signals'][:, -6:-4]  # Control signals
-                
-                # Apply column deletion
-                x_data = np.delete(x_data, delete_columns, axis=1)
-                
-                # Skip first 100 samples for stability
-                x_data = x_data[100:]  
-                u_data = u_data[100:]  
-                
-                # Data sampling
-                x_data = x_data[::config['sample_step'], :]
-                u_data = u_data[::config['sample_step'], :]
-                
-                # Extract error type and convert to one-hot encoding
-                error_type = data_dict['ErrorType']
-                p_data = np.array(integer_to_one_hot(error_type, min_val, max_val))
-                
-                x_trajectories.append(x_data)
-                u_trajectories.append(u_data)
-                p_labels.append(p_data)
-                file_labels.append(error_type)  # For stratified splitting
-                file_names.append(item)  # Track file name
-                
-                print(f"Loaded: {item}, data shape: {x_data.shape}, error type: {error_type}")
-                
-            except Exception as e:
-                print(f"Error loading file {item}: {e}")
-    
-    print(f"Total loaded {len(x_trajectories)} data files")
-    
-    if len(x_trajectories) == 0:
-        raise ValueError("No valid data files found")
-    
-    # Create complete dataset with file tracking
-    window_size = config.get('window_size', 30)
-    complete_dataset = FileTrackingTrajectoryDataset(x_trajectories, u_trajectories, p_labels, file_names, window_size)
-    
-    return complete_dataset, file_labels
-
-def create_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_state=42):
-    """
-    Create k-fold cross validation dataloaders with train/val/test split
-    Ensures that each trajectory (file) appears in only one subset (train/val/test)
-    
-    Args:
-        dataset: Complete FileTrackingTrajectoryDataset
-        file_labels: Labels for stratified splitting
-        config: Configuration dictionary
-        n_splits: Number of folds
-        random_state: Random seed
-    
-    Returns:
-        fold_dataloaders: List of (train_loader, val_loader) for each fold
-        test_loader: Fixed test loader (same for all folds)
-    """
-    
-    # Create file-level indices
-    file_indices = list(range(len(file_labels)))
-    
-    # Split into train+val (80%) and test (20%) at file level
-    sss_test = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
-    train_val_files, test_files = next(sss_test.split(file_indices, file_labels))
-    
-    print(f"File-level split: {len(train_val_files)} train+val files, {len(test_files)} test files")
-    print(f"Test files: {test_files}")
-    print(f"Train+Val files: {train_val_files}")
-    
-    # Get sample indices for test set (all samples from test files)
-    test_indices = []
-    for file_idx in test_files:
-        sample_indices = dataset.get_samples_by_file(file_idx)
-        test_indices.extend(sample_indices)
-        print(f"File {file_idx} contributes {len(sample_indices)} samples to test set")
-    
-    # Create test dataset (shared across all folds)
-    test_dataset = Subset(dataset, test_indices)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.get('batch_size', 32),
-        shuffle=False,
-        num_workers=0
-    )
-    
-    print(f"Test set: {len(test_indices)} samples from {len(test_files)} files")
-    
-    # Create k-fold splits on train+val files only
-    train_val_labels = [file_labels[i] for i in train_val_files]
-    kfold = StratifiedShuffleSplit(n_splits=n_splits, test_size=0.25, random_state=random_state)  # 25% of 80% = 20% val
-    
-    fold_dataloaders = []
-    
-    for fold_idx, (train_file_idx, val_file_idx) in enumerate(kfold.split(train_val_files, train_val_labels)):
-        print(f"Creating fold {fold_idx + 1}/{n_splits}")
-        
-        # Get actual file indices
-        train_files_fold = [train_val_files[i] for i in train_file_idx]
-        val_files_fold = [train_val_files[i] for i in val_file_idx]
-        
-        print(f"  Fold {fold_idx + 1} - Train files: {train_files_fold}")
-        print(f"  Fold {fold_idx + 1} - Val files: {val_files_fold}")
-        
-        # Get sample indices for this fold
-        train_indices_fold = []
-        val_indices_fold = []
-        
-        # Get indices for train set (all samples from train files)
-        for file_idx in train_files_fold:
-            sample_indices = dataset.get_samples_by_file(file_idx)
-            train_indices_fold.extend(sample_indices)
-        
-        # Get indices for val set (all samples from val files)
-        for file_idx in val_files_fold:
-            sample_indices = dataset.get_samples_by_file(file_idx)
-            val_indices_fold.extend(sample_indices)
-        
-        # Verify no overlap between train, val, and test
-        train_files_set = set(train_files_fold)
-        val_files_set = set(val_files_fold)
-        test_files_set = set(test_files)
-        
-        assert len(train_files_set & val_files_set) == 0, f"Overlap between train and val files in fold {fold_idx + 1}"
-        assert len(train_files_set & test_files_set) == 0, f"Overlap between train and test files in fold {fold_idx + 1}"
-        assert len(val_files_set & test_files_set) == 0, f"Overlap between val and test files in fold {fold_idx + 1}"
-        
-        print(f"  Fold {fold_idx + 1} - No file overlap verified ✓")
-        
-        # Create datasets for this fold
-        train_dataset_fold = Subset(dataset, train_indices_fold)
-        val_dataset_fold = Subset(dataset, val_indices_fold)
-        
-        # Create dataloaders
-        train_loader_fold = DataLoader(
-            train_dataset_fold,
-            batch_size=config.get('batch_size', 32),
-            shuffle=True,
-            num_workers=0
-        )
-        
-        val_loader_fold = DataLoader(
-            val_dataset_fold,
-            batch_size=config.get('batch_size', 32),
-            shuffle=False,
-            num_workers=0
-        )
-        
-        fold_dataloaders.append((train_loader_fold, val_loader_fold))
-        
-        print(f"  Fold {fold_idx + 1}: Train samples: {len(train_indices_fold)} from {len(train_files_fold)} files, "
-              f"Val samples: {len(val_indices_fold)} from {len(val_files_fold)} files")
-    
-    print(f"All folds created. Test samples: {len(test_indices)} from {len(test_files)} files (shared across all folds)")
-    
-    return fold_dataloaders, test_loader
-
-
-def create_preprocessed_kfold_dataloaders(dataset, file_labels, config, n_splits=5, random_state=42, pca_dim=2):
-    """
-    Create k-fold cross validation dataloaders with shared preprocessing (scaling + PCA) parameters.
-    Ensures that each trajectory (file) appears in only one subset (train/val/test).
-
-    Args:
-        dataset: Complete FileTrackingTrajectoryDataset
-        file_labels: Labels for stratified splitting
-        config: Configuration dictionary
-        n_splits: Number of folds
-        random_state: Random seed
-        pca_dim: Number of PCA components
-
-    Returns:
-        fold_dataloaders: List of (train_loader, val_loader) for each fold
-        test_loader: Fixed test loader (same for all folds)
-        preprocessing_params: Shared preprocessing parameters used for all folds
-    """
-    from torch.utils.data import DataLoader
-
-    # First get the basic fold dataloaders
-    fold_dataloaders, test_loader = create_kfold_dataloaders(dataset, file_labels, config, n_splits, random_state)
-
-    # Validate data split integrity
-    validate_data_split_integrity(dataset, fold_dataloaders, test_loader)
-
-    print("Fitting shared preprocessing parameters on full dataset...")
-    scaler_dataset = ScaledDataset(dataset, pca_dim=pca_dim, fit_scalers=True)
-    shared_params = scaler_dataset.get_preprocessing_params()
-
-    preprocessed_fold_dataloaders = []
-
-    for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders):
-        print(f"Applying shared preprocessing to fold {fold_idx + 1}/{n_splits}")
-
-        train_scaled = ScaledDataset(train_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
-        train_scaled.set_preprocessing_params(shared_params)
-        val_scaled = ScaledDataset(val_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
-        val_scaled.set_preprocessing_params(shared_params)
-
-        train_loader_scaled = DataLoader(train_scaled, batch_size=config.get('batch_size', 32), shuffle=True, num_workers=0)
-        val_loader_scaled = DataLoader(val_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
-
-        preprocessed_fold_dataloaders.append((train_loader_scaled, val_loader_scaled))
-
-        print(f"  Fold {fold_idx + 1}: Preprocessing applied successfully")
-    
-    # Apply preprocessing to test loader
-    test_scaled = ScaledDataset(test_loader.dataset, pca_dim=pca_dim, fit_scalers=False)
-    test_scaled.set_preprocessing_params(shared_params)
-    test_loader_scaled = DataLoader(test_scaled, batch_size=config.get('batch_size', 32), shuffle=False, num_workers=0)
-
-    print("Preprocessing applied to all datasets with file-level split integrity maintained ✓")
-
-    return preprocessed_fold_dataloaders, test_loader_scaled, shared_params
 
 
 class ScaledDataset(Dataset):
@@ -642,56 +337,31 @@ class ScaledDataset(Dataset):
         else:
             return None
 
-def validate_data_split_integrity(dataset, fold_dataloaders, test_loader):
-    """
-    Validate that there's no data leakage between train/val/test splits
-    
-    Args:
-        dataset: Original dataset with file tracking
-        fold_dataloaders: List of (train_loader, val_loader) for each fold
-        test_loader: Test data loader
-    """
-    print("Validating data split integrity...")
-    
-    # Get test file indices
-    test_file_indices = set()
-    for idx in test_loader.dataset.indices:
-        file_idx = dataset.get_file_index_for_sample(idx)
-        test_file_indices.add(file_idx)
-    
-    print(f"Test set uses files: {sorted(test_file_indices)}")
-    
-    # Check each fold
-    for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders):
-        print(f"\nValidating fold {fold_idx + 1}:")
-        
-        # Get train file indices
-        train_file_indices = set()
-        for idx in train_loader.dataset.indices:
-            file_idx = dataset.get_file_index_for_sample(idx)
-            train_file_indices.add(file_idx)
-        
-        # Get val file indices
-        val_file_indices = set()
-        for idx in val_loader.dataset.indices:
-            file_idx = dataset.get_file_index_for_sample(idx)
-            val_file_indices.add(file_idx)
-        
-        print(f"  Train set uses files: {sorted(train_file_indices)}")
-        print(f"  Val set uses files: {sorted(val_file_indices)}")
-        
-        # Check for overlaps
-        train_val_overlap = train_file_indices & val_file_indices
-        train_test_overlap = train_file_indices & test_file_indices
-        val_test_overlap = val_file_indices & test_file_indices
-        
-        if train_val_overlap:
-            raise ValueError(f"Fold {fold_idx + 1}: Train-Val file overlap detected: {train_val_overlap}")
-        if train_test_overlap:
-            raise ValueError(f"Fold {fold_idx + 1}: Train-Test file overlap detected: {train_test_overlap}")
-        if val_test_overlap:
-            raise ValueError(f"Fold {fold_idx + 1}: Val-Test file overlap detected: {val_test_overlap}")
-        
-        print(f"  Fold {fold_idx + 1}: No file overlap detected ✓")
-    
-    print("Data split integrity validation completed successfully! ✓")
+if __name__ == "__main__":
+    # Example config
+    config = {
+        'sample_step': 1,
+        'window_size': 30,
+        'batch_size': 2
+    }
+    data_dir = "./data"
+
+    # Load datasets
+    train_dataset, val_dataset = load_dataset_from_folder(data_dir, config)
+
+    # Wrap with ScaledDataset and fit scalers/PCA on train set
+    scaled_train = ScaledDataset(train_dataset, pca_dim=2, fit_scalers=True)
+    scaled_val = ScaledDataset(val_dataset, pca_dim=2)
+    # Load preprocessing params from train to val
+    scaled_val.set_preprocessing_params(scaled_train.get_preprocessing_params())
+
+    # Print first 3 samples from train and val
+    print("Train samples:")
+    for i in range(3):
+        x, u, p = scaled_train[i]
+        print(f"Sample {i}: x shape {x.shape}, u shape {u.shape}, p {p}")
+
+    print("\nValidation samples:")
+    for i in range(3):
+        x, u, p = scaled_val[i]
+        print(f"Sample {i}: x shape {x.shape}, u shape {u.shape}, p {p}")

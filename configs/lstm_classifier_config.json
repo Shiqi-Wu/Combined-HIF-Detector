@@ -1,0 +1,35 @@
+{
+  "data": {
+    "path": "./data",
+    "sample_step": 1,
+    "window_size": 2000,
+    "batch_size": 128,
+    "pca_dim": 2
+  },
+  "model": {
+    "input_size": 2,
+    "hidden_size": 128,
+    "num_layers": 2,
+    "num_classes": 6,
+    "dropout": 0.2,
+    "bidirectional": true
+  },
+  "train": {
+    "lr": 0.001,
+    "lr_factor": 0.8,
+    "lr_patience": 50,
+    "weight_decay": 1e-5,
+    "momentum": 0.9,
+    "epochs": 3000,
+    "batch": 128,
+    "grad_accum": 1,
+    "seed": 42,
+    "save_path": "./checkpoints/lstm_classifier/2000/best_model.pth"
+  },
+  "logging": {
+    "use_wandb": true,
+    "project": "lstm_classifier_project",
+    "log_dir": "./checkpoints/lstm_classifier/2000/logs",
+    "log_file": "train.log"
+  }
+}

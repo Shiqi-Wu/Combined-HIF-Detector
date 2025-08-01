@@ -3,3 +3,7 @@ data
 results
 wandb/
 evaluations/
+figures/
+checkpoints/
+*.pyc
+*.pyo
