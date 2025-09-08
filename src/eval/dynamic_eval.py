@@ -31,6 +31,7 @@ import seaborn as sns
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, top_k_accuracy_score
 
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
 
 # Add parent directories to path
@@ -232,45 +233,59 @@ def load_train_val_data(data_dir: str, train_data_config: Dict, val_data_config:
     return train_dynamic_dataset, val_dynamic_dataset
 
 
+def compute_loss_from_logits(prediction_errors: np.ndarray, true_labels: np.ndarray) -> float:
+    """
+    Convert prediction errors into logits and compute CE loss.
+    prediction_errors: [N, num_classes]
+    true_labels: [N]
+    """
+    logits = -torch.tensor(prediction_errors, dtype=torch.float64)  # 负误差 → logits
+    targets = torch.tensor(true_labels, dtype=torch.long)
+
+    criterion = nn.CrossEntropyLoss()
+    loss = criterion(logits, targets)
+    return loss.item()
+
 def calculate_top_k_accuracy(prediction_errors: np.ndarray, true_labels: np.ndarray, 
-                             k_values: List[int] = [1, 2, 3]) -> Dict[int, float]:
+                             k_values: List[int] = [1, 2, 3, 4, 5]) -> Dict[int, float]:
     """Calculate top-k accuracy based on prediction errors"""
-    prob_scores = -prediction_errors
-    
+    prob_scores = -prediction_errors  # 小误差 → 大概率
+
     top_k_accuracies = {}
     for k in k_values:
         if k <= prob_scores.shape[1]:
-            top_k_acc = top_k_accuracy_score(true_labels, prob_scores, k=k, labels=range(prob_scores.shape[1]))
+            top_k_acc = top_k_accuracy_score(
+                true_labels,
+                prob_scores,
+                k=k,
+                labels=list(range(prob_scores.shape[1]))
+            )
             top_k_accuracies[k] = top_k_acc
         else:
-            top_k_accuracies[k] = top_k_accuracies.get(1, 0.0)
-    
+            top_k_accuracies[k] = 0.0
     return top_k_accuracies
 
 
 def evaluate(config_path: str = 'config.json'):
-    """Evaluate known control classifier and save top-k accuracy results"""
+    """Evaluate known control classifier and save results as CSV (aligned with LSTM evaluation)"""
 
     # === Load config ===
     with open(config_path, 'r') as f:
         config = json.load(f)
     
     data_dir = config['data_dir']
-    # preprocessing_params_path = config['preprocessing_params']
-    save_path = config.get('save_path', 'evaluation_results.json')
-    
-    
+    save_csv = config.get('save_csv', 'evaluation_results.csv')
+
     # Data config
     train_config = config['train_data_config']
     val_config = config['val_data_config']
-    k_values = config.get('k_values', [1, 2, 3])
+    k_values = config.get('k_values', [1, 2, 3, 4, 5])   # 默认计算 top1-5
 
     # === Load and preprocess data ===
     train_dataset, val_dataset = load_train_val_data(
         data_dir=data_dir,
         train_data_config=train_config,
         val_data_config=val_config,
-        # preprocessing_params_path=preprocessing_params_path
     )
 
     # === Initialize and train classifier ===
@@ -280,7 +295,6 @@ def evaluate(config_path: str = 'config.json'):
     # === Evaluate on train and val ===
     print("\n[Train Evaluation]")
     train_results = classifier.evaluate_dataset(train_dataset)
-
     print("\n[Validation Evaluation]")
     val_results = classifier.evaluate_dataset(val_dataset)
 
@@ -288,27 +302,28 @@ def evaluate(config_path: str = 'config.json'):
     train_topk = calculate_top_k_accuracy(train_results['prediction_errors'], train_results['true_labels'], k_values)
     val_topk = calculate_top_k_accuracy(val_results['prediction_errors'], val_results['true_labels'], k_values)
 
-    # === Save results ===
+    # === Compute CE loss from logits ===
+    train_loss = compute_loss_from_logits(train_results['prediction_errors'], train_results['true_labels'])
+    val_loss = compute_loss_from_logits(val_results['prediction_errors'], val_results['true_labels'])
+
+    # === Prepare aligned results (same format as LSTM eval) ===
     results = {
-        'train': {
-            'eval_len': len(train_results['true_labels']),
-            'top_k_accuracies': {f'top_{k}': float(v) for k, v in train_topk.items()}
-        },
-        'val': {
-            'eval_len': len(val_results['true_labels']),
-            'top_k_accuracies': {f'top_{k}': float(v) for k, v in val_topk.items()}
-        }
+        "dataset": ["train", "val"],
+        "loss": [train_loss, val_loss]
     }
+    for k in k_values:
+        results[f"top{k}_acc"] = [float(train_topk.get(k, 0.0)), float(val_topk.get(k, 0.0))]
 
-    # === Save results ===
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(results)
+    save_csv = Path(save_csv)
+    save_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(save_csv, index=False)
 
-    with open(save_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\nEvaluation results saved to {save_path}")
+    print(f"\nEvaluation results saved to {save_csv}")
+    print(df)
     return
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Known Control Classifier")

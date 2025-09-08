@@ -1,6 +1,6 @@
 {
   "data_dir": "./data",
-  "save_path": "./evaluations/dynamical_system/known_controls/2417/evaluation_results.json",
+  "save_path": "./checkpoints/known_controls/2417/evaluation_results.json",
   "train_data_config": {
     "window_size": 2417,
     "sample_step": 1,

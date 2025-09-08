@@ -3,7 +3,7 @@
     "path": "./data",
     "sample_step": 1,
     "window_size": 2000,
-    "batch_size": 128,
+    "batch_size": 32,
     "pca_dim": 2
   },
   "model": {
@@ -21,7 +21,7 @@
     "weight_decay": 1e-5,
     "momentum": 0.9,
     "epochs": 3000,
-    "batch": 128,
+    "batch": 32,
     "grad_accum": 1,
     "seed": 42,
     "save_path": "./checkpoints/lstm_classifier/2000/best_model.pth"

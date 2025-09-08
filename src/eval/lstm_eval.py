@@ -1,737 +1,107 @@
-#!/usr/bin/env python3
-"""
-LSTM Evaluation Script
-
-This script provides comprehensive evaluation of trained LSTM models including:
-1. Data loading with same preprocessing as training
-2. Training history visualization (loss and accuracy curves)
-3. Model evaluation on train/val/test sets with boxplot visualization
-"""
-
-import os
-import sys
-import json
-import pickle
-import argparse
-from pathlib import Path
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Dict, List, Tuple, Optional
-from collections import defaultdict, Counter
-
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import json
+import os
+import sys
+import argparse
+import logging
+import pandas as pd
 
-
-# Add parent directories to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import utils.dataloader as dataloader_module
 from models.fault_lstm_classifier import LSTMClassifier
-from utils.dataloader import load_full_dataset, create_kfold_dataloaders, ScaledDataset
-
-# Set style for plots
-plt.style.use('seaborn-v0_8')
-sns.set_palette("husl")
-
-class LSTMEvaluator:
-    """Comprehensive LSTM model evaluator"""
-    
-    def __init__(self, results_dir: str, data_dir: str, preprocessing_params_path: str):
-        """
-        Initialize the evaluator
-        
-        Args:
-            results_dir: Directory containing fold results
-            data_dir: Directory containing original data
-            preprocessing_params_path: Path to preprocessing parameters pickle file
-        """
-        self.results_dir = Path(results_dir)
-        self.data_dir = data_dir
-        self.preprocessing_params_path = preprocessing_params_path
-        
-        # Set device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
-        
-        # Data containers
-        self.datasets = {}
-        self.training_histories = {}
-        self.evaluation_results = {}
-        
-    def load_preprocessing_params(self) -> Dict:
-        """Load preprocessing parameters from pickle file"""
-        print(f"Loading preprocessing parameters from {self.preprocessing_params_path}")
-        
-        if not os.path.exists(self.preprocessing_params_path):
-            raise FileNotFoundError(f"Preprocessing parameters file not found: {self.preprocessing_params_path}")
-        
-        with open(self.preprocessing_params_path, 'rb') as f:
-            params = pickle.load(f)
-        
-        print("Preprocessing parameters loaded successfully")
-        return params
-    
-    def load_data(self, data_config: Dict, k_folds: int = 5, random_state: int = 42) -> None:
-        """
-        Load and preprocess data same as training
-        
-        Args:
-            data_config: Data configuration dictionary
-            k_folds: Number of folds
-            random_state: Random seed
-        """
-        print("\n===== Loading Dataset =====")
-        
-        # Load full dataset
-        dataset, file_labels = load_full_dataset(self.data_dir, data_config)
-        print(f"Loaded dataset with {len(dataset)} samples from {len(file_labels)} files")
-        
-        # Create K-fold splits
-        fold_dataloaders, test_loader = create_kfold_dataloaders(
-            dataset, file_labels, data_config, k_folds, random_state
-        )
-        
-        # Load preprocessing parameters
-        preprocessing_params = self.load_preprocessing_params()
-        
-        # Apply preprocessing to test set (shared across all folds)
-        test_scaled = ScaledDataset(test_loader.dataset, pca_dim=2, fit_scalers=False)
-        test_scaled.set_preprocessing_params(preprocessing_params)
-        test_loader_scaled = DataLoader(test_scaled, batch_size=data_config.get('batch_size', 32), shuffle=False, num_workers=0)
-        
-        # Store test dataset
-        self.datasets['test'] = test_loader_scaled.dataset
-        
-        # Apply preprocessing to each fold
-        self.datasets['folds'] = []
-        for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders):
-            print(f"Applying preprocessing to fold {fold_idx + 1}/{k_folds}")
-            
-            # Apply preprocessing
-            train_scaled = ScaledDataset(train_loader.dataset, pca_dim=2, fit_scalers=False)
-            train_scaled.set_preprocessing_params(preprocessing_params)
-            val_scaled = ScaledDataset(val_loader.dataset, pca_dim=2, fit_scalers=False)
-            val_scaled.set_preprocessing_params(preprocessing_params)
-            
-            train_loader_scaled = DataLoader(train_scaled, batch_size=data_config.get('batch_size', 32), shuffle=False, num_workers=0)
-            val_loader_scaled = DataLoader(val_scaled, batch_size=data_config.get('batch_size', 32), shuffle=False, num_workers=0)
-            
-            self.datasets['folds'].append({
-                'train': train_loader_scaled.dataset,
-                'val': val_loader_scaled.dataset,
-                'fold_idx': fold_idx,
-            })
-        
-        print(f"Data loading completed for {len(self.datasets['folds'])} folds")
-    
-    def load_training_histories(self) -> None:
-        """Load training history JSON files from each fold"""
-        print("\n===== Loading Training Histories =====")
-        
-        for fold_dir in sorted(self.results_dir.glob("fold_*")):
-            fold_num = int(fold_dir.name.split("_")[1])
-            history_file = fold_dir / f"training_history_fold_{fold_num}.json"
-            
-            if history_file.exists():
-                with open(history_file, 'r') as f:
-                    history = json.load(f)
-                self.training_histories[fold_num] = history
-                print(f"Loaded training history for fold {fold_num}")
-            else:
-                print(f"Warning: Training history not found for fold {fold_num}")
-        
-        print(f"Loaded training histories for {len(self.training_histories)} folds")
-    
-    def get_available_model_paths(self) -> List[Tuple[int, Path]]:
-        """
-        Get list of available model paths for each fold
-        
-        Returns:
-            List of tuples (fold_num, model_path)
-        """
-        model_paths = []
-        
-        for fold_dir in sorted(self.results_dir.glob("fold_*")):
-            fold_num = int(fold_dir.name.split("_")[1])
-            model_file = fold_dir / f"best_model_fold_{fold_num}.pth"
-            
-            if model_file.exists():
-                model_paths.append((fold_num, model_file))
-            else:
-                print(f"Warning: Model file not found for fold {fold_num}")
-        
-        return model_paths
-    
-    def load_single_model(self, model_path: Path, model_config: Dict) -> Tuple[nn.Module, Dict]:
-        """
-        Load a single model from checkpoint
-        
-        Args:
-            model_path: Path to model checkpoint
-            model_config: Model configuration dictionary
-            
-        Returns:
-            Tuple of (model, checkpoint_info)
-        """
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location='cpu')
-        
-        # Create model
-        model = LSTMClassifier(**model_config).to(torch.float64)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(self.device)
-        model.eval()
-        
-        checkpoint_info = {
-            'epoch': checkpoint['epoch'],
-            'val_accuracy': checkpoint['val_accuracy']
-        }
-        
-        return model, checkpoint_info
-    
-    def evaluate_model_on_dataset(self, model: nn.Module, dataset, batch_size: int = 32, trajectory_level: bool = False) -> Dict[str, float]:
-        """
-        Evaluate a single model on a dataset
-        
-        Args:
-            model: Trained model
-            dataset: Dataset to evaluate on
-            batch_size: Batch size for evaluation
-            
-        Returns:
-            Dictionary with loss and accuracy
-        """
-        model.eval()
-        criterion = nn.CrossEntropyLoss()
-        
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-        
-        total_loss = 0
-        total_correct = 0
-        total_samples = 0
-
-        global_sample_index = 0
-        trajectory_predictions = defaultdict(list)
-        trajectory_labels = {}
-        subset_indices = getattr(dataset, "indices", None)
-
-        with torch.no_grad():
-            for batch in dataloader:
-                x_batch, u_batch, p_batch = batch
-                x_batch = x_batch.to(self.device).to(torch.float64)
-                u_batch = u_batch.to(self.device).to(torch.float64)
-                
-                # Convert one-hot to class indices if needed
-                if p_batch.dim() > 1 and p_batch.size(1) > 1:
-                    p_indices = torch.argmax(p_batch, dim=1)
-                else:
-                    p_indices = p_batch.long()
-                p_indices = p_indices.to(self.device)
-                
-                outputs = model(x_batch)
-                loss = criterion(outputs, p_indices)
-                
-                total_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total_samples += p_indices.size(0)
-                total_correct += (predicted == p_indices).sum().item()
-
-                if trajectory_level:
-                    for i in range(len(p_indices)):
-                        if hasattr(dataset, "get_file_index_for_sample"):
-                            if subset_indices is not None:
-                                global_idx = subset_indices[global_sample_index]
-                            else:
-                                global_idx = global_sample_index
-                        traj_id = dataset.get_file_index_for_sample(global_idx)
-                        trajectory_predictions[traj_id].append(predicted[i].item())
-                        trajectory_labels[traj_id] = p_indices[i].item()
-                        global_sample_index += 1
-
-                avg_loss = total_loss / len(dataloader)
-                accuracy = total_correct / total_samples
-
-                if trajectory_level:
-                    print(f"[DEBUG]Total trajectories found: {len(trajectory_predictions)}")
-                    print("[DEBUG]Sample trajectory lengths:")
-                    for traj_id, preds in list(trajectory_predictions.items())[:5]:
-                        print(f"  {traj_id}: {len(preds)} predictions")
-                    correct_trajectories = 0
-                    for traj_id, preds in trajectory_predictions.items():
-                        majority_vote = Counter(preds).most_common(1)[0][0]
-                        if majority_vote == trajectory_labels[traj_id]:
-                            correct_trajectories += 1
-                    traj_acc = correct_trajectories / len(trajectory_labels)
-                    return {
-                    'loss': avg_loss,
-                    'accuracy': accuracy,  # sample-level
-                    'trajectory_accuracy': traj_acc,
-                    'total_samples': total_samples,
-                    'total_trajectories': len(trajectory_labels),
-                    }
 
 
-        
+def topk_accuracy(output, target, topk=(1,)):
+    """Compute top-k accuracy for specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
 
-        
-        return {
-            'loss': avg_loss,
-            'accuracy': accuracy,
-            'total_samples': total_samples
-        }
-    
-    
-    def evaluate_all_models(self, model_config: Dict, batch_size: int = 32, save_csv: Optional[str] = None, trajectory_level: bool = False) -> None:
-        """
-        Evaluate all models sequentially (one at a time to save memory)
-        
-        Args:
-            model_config: Model configuration dictionary
-            batch_size: Batch size for evaluation
-            save_csv: Path to save results CSV file (optional)
-        """
-        print("\n===== Evaluating All Models (Sequential Loading) =====")
-        
-        # Get available model paths
-        model_paths = self.get_available_model_paths()
-        
-        if not model_paths:
-            print("No model files found!")
-            return
-        
-        self.evaluation_results = {}
-        
-        for fold_num, model_path in model_paths:
-            print(f"Loading and evaluating fold {fold_num}...")
-            
-            # Load model for this fold only
-            model, checkpoint_info = self.load_single_model(model_path, model_config)
-            print(f"  Loaded model (epoch {checkpoint_info['epoch']}, val_acc: {checkpoint_info['val_accuracy']:.4f})")
-            
-            # Get fold data
-            fold_data = self.datasets['folds'][fold_num - 1]  # fold_num is 1-indexed
-            
-            # Evaluate on train, val, test
-            results = {}
-            
-            # Train set
-            results['train'] = self.evaluate_model_on_dataset(model, fold_data['train'], batch_size, trajectory_level)
-            print(f"  Train - Loss: {results['train']['loss']:.4f}, Acc: {results['train']['accuracy']:.4f}")
-            
-            # Validation set
-            results['val'] = self.evaluate_model_on_dataset(model, fold_data['val'], batch_size, trajectory_level)
-            print(f"  Val   - Loss: {results['val']['loss']:.4f}, Acc: {results['val']['accuracy']:.4f}")
-            
-            # Test set
-            results['test'] = self.evaluate_model_on_dataset(model, self.datasets['test'], batch_size, trajectory_level)
-            print(f"  Test  - Loss: {results['test']['loss']:.4f}, Acc: {results['test']['accuracy']:.4f}")
-            
-            # Store results
-            self.evaluation_results[fold_num] = results
-            
-            # Clear model from memory
-            del model
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            print(f"  Model for fold {fold_num} evaluated and cleared from memory")
+    _, pred = output.topk(maxk, 1, True, True)   # [batch, maxk]
+    pred = pred.t()                              # [maxk, batch]
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-        # Save results to CSV if requested
-        if save_csv:
-            self._save_evaluation_to_csv(save_csv)
-
-        print("Model evaluation completed")
-    
-    def plot_training_histories(self, save_dir: Optional[str] = None) -> None:
-        """
-        Plot training loss and accuracy curves for all folds
-        
-        Args:
-            save_dir: Directory to save plots (optional)
-        """
-        print("\n===== Plotting Training Histories =====")
-        
-        if not self.training_histories:
-            print("No training histories loaded")
-            return
-        
-        # Create figure with subplots
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Training History Across All Folds', fontsize=16)
-        
-        # Prepare data for plotting
-        all_train_loss = []
-        all_val_loss = []
-        all_train_acc = []
-        all_val_acc = []
-        
-        colors = plt.cm.tab10(np.linspace(0, 1, len(self.training_histories)))
-        
-        for i, (fold_num, history) in enumerate(self.training_histories.items()):
-            epochs = range(1, len(history['train_loss']) + 1)
-            color = colors[i]
-            
-            # Training and validation loss
-            axes[0, 0].plot(epochs, history['train_loss'], 
-                           label=f'Fold {fold_num}', color=color, alpha=0.7)
-            axes[0, 1].plot(epochs, history['val_loss'], 
-                           label=f'Fold {fold_num}', color=color, alpha=0.7)
-            
-            # Training and validation accuracy
-            axes[1, 0].plot(epochs, history['train_acc'], 
-                           label=f'Fold {fold_num}', color=color, alpha=0.7)
-            axes[1, 1].plot(epochs, history['val_acc'], 
-                           label=f'Fold {fold_num}', color=color, alpha=0.7)
-            
-            # Collect data for summary statistics
-            all_train_loss.extend(history['train_loss'])
-            all_val_loss.extend(history['val_loss'])
-            all_train_acc.extend(history['train_acc'])
-            all_val_acc.extend(history['val_acc'])
-        
-        # Configure subplots
-        axes[0, 0].set_title('Training Loss')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        axes[0, 1].set_title('Validation Loss')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Loss')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        axes[1, 0].set_title('Training Accuracy')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Accuracy')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        axes[1, 1].set_title('Validation Accuracy')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Accuracy')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot if requested
-        if save_dir:
-            save_path = Path(save_dir) / 'training_history.png'
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Training history plot saved to {save_path}")
-        
-        plt.show()
-        
-        # Print summary statistics
-        print("\nTraining History Summary:")
-        print(f"  Training Loss   - Mean: {np.mean(all_train_loss):.4f}, Std: {np.std(all_train_loss):.4f}")
-        print(f"  Validation Loss - Mean: {np.mean(all_val_loss):.4f}, Std: {np.std(all_val_loss):.4f}")
-        print(f"  Training Acc    - Mean: {np.mean(all_train_acc):.4f}, Std: {np.std(all_train_acc):.4f}")
-        print(f"  Validation Acc  - Mean: {np.mean(all_val_acc):.4f}, Std: {np.std(all_val_acc):.4f}")
-    
-    def plot_evaluation_boxplots(self, save_dir: Optional[str] = None) -> None:
-        """
-        Plot boxplots of model evaluation results across folds
-
-        Args:
-            save_dir: Directory to save plots (optional)
-        """
-        print("\n===== Plotting Evaluation Boxplots =====")
-
-        if not self.evaluation_results:
-            print("No evaluation results available")
-            return
-
-        # Prepare data
-        sample_data = []
-        traj_data = []
-        has_traj = False
-
-        for fold_num, results in self.evaluation_results.items():
-            for dataset_name in ['train', 'val', 'test']:
-                result = results[dataset_name]
-                dataset_label = dataset_name.capitalize()
-                sample_data.append({
-                    'Fold': fold_num,
-                    'Dataset': dataset_label,
-                    'Loss': result['loss'],
-                    'Accuracy': result['accuracy']
-                })
-                if 'trajectory_accuracy' in result:
-                    has_traj = True
-                    traj_data.append({
-                        'Fold': fold_num,
-                        'Dataset': dataset_label,
-                        'Loss': result['loss'],
-                        'Trajectory Accuracy': result['trajectory_accuracy']
-                    })
-
-        df_sample = pd.DataFrame(sample_data)
-
-        # ----- Sample-Level Plot -----
-        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-        fig.suptitle('Sample-Level Evaluation Results', fontsize=16)
-
-        sns.boxplot(data=df_sample, x='Dataset', y='Loss', ax=axes[0])
-        axes[0].set_title('Loss Distribution')
-        axes[0].set_ylabel('Loss')
-        axes[0].grid(True, alpha=0.3)
-        sns.stripplot(data=df_sample, x='Dataset', y='Loss', ax=axes[0],
-                  color='red', alpha=0.7, size=8)
-
-        sns.boxplot(data=df_sample, x='Dataset', y='Accuracy', ax=axes[1])
-        axes[1].set_title('Sample-Level Accuracy Distribution')
-        axes[1].set_ylabel('Accuracy')
-        axes[1].grid(True, alpha=0.3)
-        sns.stripplot(data=df_sample, x='Dataset', y='Accuracy', ax=axes[1],
-                  color='red', alpha=0.7, size=8)
-
-        plt.tight_layout()
-        if save_dir:
-            save_path = Path(save_dir) / 'evaluation_boxplots_sample.png'
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Sample-level boxplots saved to {save_path}")
-        plt.show()
-
-        # ----- Trajectory-Level Plot -----
-        if has_traj:
-            df_traj = pd.DataFrame(traj_data)
-
-            fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-            fig.suptitle('Trajectory-Level Accuracy Results', fontsize=16)
-
-            sns.boxplot(data=df_traj, x='Dataset', y='Trajectory Accuracy', ax=ax)
-            ax.set_title('Trajectory-Level Accuracy Distribution')
-            ax.set_ylabel('Trajectory Accuracy')
-            ax.grid(True, alpha=0.3)
-            sns.stripplot(data=df_traj, x='Dataset', y='Trajectory Accuracy', ax=ax,
-                      color='blue', alpha=0.7, size=8)
-
-            plt.tight_layout()
-            if save_dir:
-                save_path = Path(save_dir) / 'evaluation_boxplots_trajectory.png'
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                print(f"Trajectory-level boxplots saved to {save_path}")
-            plt.show()
-
-        # ----- Print Summary -----
-        print("\nEvaluation Summary (Sample-Level):")
-        print(df_sample.groupby('Dataset').agg({
-            'Loss': ['mean', 'std'],
-            'Accuracy': ['mean', 'std']
-        }).round(4))
-
-        if has_traj:
-            print("\nEvaluation Summary (Trajectory-Level):")
-            print(df_traj.groupby('Dataset').agg({
-                'Trajectory Accuracy': ['mean', 'std']
-            }).round(4))
-
-    
-    def save_evaluation_results(self, save_dir: str) -> None:
-        """
-        Save evaluation results to files
-        
-        Args:
-            save_dir: Directory to save results
-        """
-        save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
-        
-        # Save evaluation results as JSON
-        results_file = save_path / 'evaluation_results.json'
-        with open(results_file, 'w') as f:
-            json.dump(self.evaluation_results, f, indent=2)
-        
-        print(f"Evaluation results saved to {results_file}")
-    
-    def _save_evaluation_to_csv(self, csv_path: str) -> None:
-        """
-        Save evaluation results to CSV file
-        
-        Args:
-            csv_path: Path to save CSV file
-        """
-        print(f"\n===== Saving Evaluation Results to CSV =====")
-        
-        if not self.evaluation_results:
-            print("No evaluation results to save")
-            return
-        
-        # Prepare data for CSV
-        csv_data = []
-        
-        for fold_num, results in self.evaluation_results.items():
-            for dataset_name in ['train', 'val', 'test']:
-                csv_data.append({
-                    'fold': fold_num,
-                    'dataset': dataset_name,
-                    'loss': results[dataset_name]['loss'],
-                    'accuracy': results[dataset_name]['accuracy'],
-                })
-        
-        # Create DataFrame and save to CSV
-        df = pd.DataFrame(csv_data)
-        
-        # Create directory if it doesn't exist
-        Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save to CSV
-        df.to_csv(csv_path, index=False)
-        print(f"Evaluation results saved to {csv_path}")
-        
-        # Print summary
-        print("\nCSV Summary:")
-        print(f"  Total rows: {len(df)}")
-        print(f"  Folds: {sorted(df['fold'].unique())}")
-        print(f"  Datasets: {sorted(df['dataset'].unique())}")
-        
-        # Show first few rows
-        print("\nFirst few rows:")
-        print(df.head().to_string(index=False))
-    
-    def run_full_evaluation(self, model_config: Dict, data_config: Dict, 
-                           k_folds: int = 5, random_state: int = 42, 
-                           save_dir: Optional[str] = None,
-                           trajectory_level: bool = False,
-                           ) -> None:
-        """
-        Run complete evaluation pipeline
-        
-        Args:
-            model_config: Model configuration
-            data_config: Data configuration
-            k_folds: Number of folds
-            random_state: Random seed
-            save_dir: Directory to save results and plots
-        """
-        print("="*60)
-        print("STARTING COMPREHENSIVE LSTM EVALUATION")
-        print("="*60)
-        
-        # Create save directory
-        if save_dir:
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Step 1: Load data
-        self.load_data(data_config, k_folds, random_state)
-        
-        # Step 2: Load training histories
-        self.load_training_histories()
-        
-        # Step 3: Evaluate models (sequential loading)
-        csv_path = None
-        if save_dir:
-            csv_path = str(Path(save_dir) / 'fold_evaluation_results.csv')
-        self.evaluate_all_models(model_config, data_config.get('batch_size', 32), csv_path, trajectory_level)
-        
-        # Step 4: Plot training histories
-        self.plot_training_histories(save_dir)
-        
-        # Step 5: Plot evaluation boxplots
-        self.plot_evaluation_boxplots(save_dir)
-        
-        # Step 6: Save results
-        if save_dir:
-            self.save_evaluation_results(save_dir)
-        
-        print("="*60)
-        print("EVALUATION COMPLETED")
-        print("="*60)
+    res = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        res.append((correct_k / batch_size).item())
+    return res
 
 
-def main():
-    """Main function for command line usage"""
-    parser = argparse.ArgumentParser(description='LSTM Model Evaluation')
-    
-    # Required arguments
-    parser.add_argument('--results_dir', type=str, required=True,
-                       help='Directory containing fold results')
-    parser.add_argument('--data_dir', type=str, required=True,
-                       help='Directory containing original data')
-    
-    # Optional arguments
-    parser.add_argument('--preprocessing_params', type=str, 
-                       default='/home/shiqi_w/code/Combined-HIF-detector/preprocessing_params_fold.pkl',
-                       help='Path to preprocessing parameters pickle file')
-    parser.add_argument('--save_dir', type=str, default=None,
-                       help='Directory to save evaluation results and plots')
-    parser.add_argument('--csv_file', type=str, default=None,
-                       help='Path to save evaluation results CSV file')
-    parser.add_argument('--k_folds', type=int, default=5,
-                       help='Number of folds')
-    parser.add_argument('--random_state', type=int, default=42,
-                       help='Random seed')
-    
-    # Data parameters
-    parser.add_argument('--window_size', type=int, default=30,
-                       help='Window size')
-    parser.add_argument('--sample_step', type=int, default=1,
-                       help='Sampling step')
-    parser.add_argument('--batch_size', type=int, default=64,
-                       help='Batch size for evaluation')
-    parser.add_argument('--trajectory_level', action='store_true', default=True,
-                       help='Use trajectory level eval')
-    
-    # Model parameters
-    parser.add_argument('--hidden_size', type=int, default=128,
-                       help='Hidden size')
-    parser.add_argument('--num_layers', type=int, default=2,
-                       help='Number of LSTM layers')
-    parser.add_argument('--dropout', type=float, default=0.2,
-                       help='Dropout rate')
-    parser.add_argument('--bidirectional', action='store_true', default=True,
-                       help='Use bidirectional LSTM')
+def evaluate(model, dataloader, criterion, device, topk=(1,5)):
+    model.eval()
+    total_loss, total_samples = 0, 0
+    topk_sums = [0 for _ in topk]
 
-    
-    
-    args = parser.parse_args()
-    
-    # Configuration
-    data_config = {
-        'window_size': args.window_size,
-        'sample_step': args.sample_step,
-        'batch_size': args.batch_size
-    }
-    
-    model_config = {
-        'input_size': 2,  # After PCA
-        'hidden_size': args.hidden_size,
-        'num_layers': args.num_layers,
-        'num_classes': 6,  # ErrorType: 2~7
-        'dropout': args.dropout,
-        'bidirectional': args.bidirectional
-    }
-    
-    # Create evaluator
-    evaluator = LSTMEvaluator(
-        results_dir=args.results_dir,
-        data_dir=args.data_dir,
-        preprocessing_params_path=args.preprocessing_params
+    with torch.no_grad():
+        for x, _, p in dataloader:
+            x = x.to(device).to(torch.float64)
+            target = torch.argmax(p, dim=1).to(device)
+
+            outputs = model(x)
+            loss = criterion(outputs, target)
+
+            batch_size = target.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+            accs = topk_accuracy(outputs, target, topk)
+            for i, acc in enumerate(accs):
+                topk_sums[i] += acc * batch_size
+
+    avg_loss = total_loss / total_samples
+    avg_accs = [s / total_samples for s in topk_sums]
+    return avg_loss, avg_accs
+
+
+def main(config_path, model_path, output_csv):
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    logging.basicConfig(level=logging.INFO)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # load dataset
+    data_cfg = config["data"]
+    train_dataset, val_dataset = dataloader_module.load_dataset_from_folder(
+        data_dir=data_cfg["path"], config=data_cfg
     )
-    
-    # Run evaluation
-    save_dir = args.save_dir
-    if args.csv_file and not save_dir:
-        # If CSV file is specified but no save_dir, use CSV file's directory as save_dir
-        save_dir = str(Path(args.csv_file).parent)
-    
-    evaluator.run_full_evaluation(
-        model_config=model_config,
-        data_config=data_config,
-        k_folds=args.k_folds,
-        random_state=args.random_state,
-        save_dir=save_dir,
-        trajectory_level=args.trajectory_level,
-    )
-    
-    # Save to specific CSV file if requested
-    # if args.csv_file:
-    #     evaluator._save_evaluation_to_csv(args.csv_file)
+
+    scaled_train = dataloader_module.ScaledDataset(train_dataset, pca_dim=data_cfg.get("pca_dim", 2), fit_scalers=True)
+    scaled_val = dataloader_module.ScaledDataset(val_dataset, pca_dim=data_cfg.get("pca_dim", 2))
+    scaled_val.set_preprocessing_params(scaled_train.get_preprocessing_params())
+
+    train_loader = torch.utils.data.DataLoader(scaled_train, batch_size=config["train"]["batch"], shuffle=False)
+    val_loader = torch.utils.data.DataLoader(scaled_val, batch_size=config["train"]["batch"], shuffle=False)
+
+    # load model
+    model = LSTMClassifier(config=config["model"]).to(device).to(torch.float64)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    criterion = nn.CrossEntropyLoss()
+
+    # evaluate
+    train_loss, train_accs = evaluate(model, train_loader, criterion, device, topk=(1,2,3,4,5))
+    val_loss, val_accs = evaluate(model, val_loader, criterion, device, topk=(1,2,3,4,5))
+
+    # save to csv
+    results = {
+        "dataset": ["train", "val"],
+        "loss": [train_loss, val_loss]
+    }
+    for i, k in enumerate([1,2,3,4,5]):
+        results[f"top{k}_acc"] = [train_accs[i], val_accs[i]]
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_csv, index=False)
+    logging.info(f"Results saved to {output_csv}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Evaluate LSTM Classifier")
+    parser.add_argument("--config", type=str, default="config_lstm_classifier.json")
+    parser.add_argument("--model_path", type=str, default="best_model.pth")
+    parser.add_argument("--output_csv", type=str, default="eval_results.csv")
+    args = parser.parse_args()
+
+    torch.set_default_dtype(torch.float64)
+    main(args.config, args.model_path, args.output_csv)

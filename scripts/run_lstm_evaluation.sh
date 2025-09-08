@@ -2,11 +2,11 @@
 
 # Simple LSTM Evaluation Script
 
-python ./src/eval/lstm_eval.py \
-    --results_dir "./results/results_kfold_1gpu_8192" \
-    --data_dir "data" \
-    --preprocessing_params "/home/shiqi_w/code/Combined-HIF-detector/preprocessing_params_fold.pkl" \
-    --save_dir "./evaluations/evaluation_lstm" \
-    --csv_file "./evaluation_results/fold_evaluation_results.csv" \
-    --bidirectional \
-    --trajectory_level
+CONFIG_FILE="configs/lstm_classifier_config.json"
+MODEL_PATH="checkpoints/lstm_classifier/2000/best_model.pth"
+OUTPUT_CSV="checkpoints/lstm_classifier/2000/eval_results.csv"
+
+python src/eval/lstm_eval.py \
+    --config $CONFIG_FILE \
+    --model_path $MODEL_PATH \
+    --output_csv $OUTPUT_CSV
