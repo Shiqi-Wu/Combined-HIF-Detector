@@ -1,0 +1,32 @@
+{
+  "data": {
+    "path": "./data",
+    "sample_step": 1,
+    "window_size": 2000,
+    "batch_size": 16,
+    "pca_dim": 2,
+    "preprocessing_path": "./checkpoints/koopman_phi/pca_params.pkl"
+  },
+  "model": {
+    "input_dim": 2,
+    "latent_dim": 32,
+    "hidden_dim": 128,
+    "num_blocks": 3,
+    "num_classes": 6
+  },
+  "train": {
+    "epochs": 200,
+    "lr": 0.001,
+    "weight_decay": 1e-5,
+    "grad_clip": 5.0,
+    "seed": 42,
+    "device": "auto",
+    "save_every": 50,
+    "save_path": "./checkpoints/koopman_phi/best_model.pt"
+  },
+  "logging": {
+    "use_wandb": false,
+    "project": "koopman_phi_training",
+    "run_name": null
+  }
+}

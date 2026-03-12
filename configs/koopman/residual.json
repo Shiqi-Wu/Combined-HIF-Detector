@@ -1,0 +1,28 @@
+{
+  "data": {
+    "path": "./data",
+    "sample_step": 1,
+    "window_size": 2000,
+    "batch_size": 16,
+    "pca_dim": 2,
+    "preprocessing_path": "./checkpoints/koopman_residual/pca_params.pkl"
+  },
+  "model": {
+    "input_dim": 2,
+    "latent_dim": 32,
+    "hidden_dim": 128,
+    "num_blocks": 3,
+    "num_classes": 6
+  },
+  "train": {
+    "base_epochs": 150,
+    "residual_epochs": 100,
+    "base_lr": 0.001,
+    "residual_lr": 0.001,
+    "weight_decay": 1e-5,
+    "grad_clip": 5.0,
+    "seed": 42,
+    "device": "auto",
+    "save_path": "./checkpoints/koopman_residual/best_model.pt"
+  }
+}
