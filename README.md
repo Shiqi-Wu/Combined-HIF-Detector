@@ -1,143 +1,208 @@
-# Combined-HIF-Detector (中英文说明 / Bilingual README)
+# Combined-HIF-Detector
 
-## 项目简介 / Overview
-本项目用于电力配电网高阻接地故障（HIF）的**定位**研究。代码实现了多种方法并支持训练、评估和对比。
-This project focuses on **localizing** high-impedance faults (HIF) in power distribution grids. It implements multiple methods and supports training, evaluation, and comparison.
+This repository contains the current Python implementation for high-impedance fault (HIF) localization in power distribution grids. In the present dataset, only a small set of discrete fault positions is available, so the first-stage formulation appears as a six-class fault-type classification problem. Conceptually, however, the intended task is fault localization.
 
-## 能做什么 / What It Can Do
-- 从 `data/` 中的仿真轨迹数据构建训练/验证集。
-- 训练 LSTM 分类器并输出模型与日志。
-- 评估 LSTM、动态系统、Koopman 方法的 top‑k 精度与窗口长度趋势。
-- 生成对比图与诊断图（误差分布、残差 Koopman 热图等）。
-- 支持多种实验配置与可复现实验脚本。
+## Scope
 
-- Build train/validation splits from simulated trajectories in `data/`.
-- Train LSTM classifiers and save checkpoints/logs.
-- Evaluate LSTM, dynamic-system, and Koopman methods with top‑k accuracy and window-length trends.
-- Generate comparison and diagnostic figures (error distributions, residual Koopman heatmaps, etc.).
-- Support multiple experiment configs and reproducible scripts.
+The repository supports three main method families:
 
-## 目录结构 / Directory Map
-- `configs/`: 按方法组织的配置文件。
-- `data/`: 输入数据（`.npy` 轨迹文件）。
-- `scripts/`: 训练/评估脚本。
-- `src/common/`: 共享预处理与公共工具。
-- `src/lstm/`: LSTM 模型、训练与评估。
-- `src/dynamic/`: 动态系统方法。
-- `src/koopman/`: Koopman 与 residual Koopman 方法。
-- `src/experimental/`: 实验性模块（如 Seq2Seq）。
-- `src/eval_runner.py`: 统一评估入口。
-- `test/`: 分析与诊断脚本。
-- `tools/`: 结果可视化与对比工具。
-- `notes/`: 实验报告与图表。
+- BiLSTM sequence classification
+- Dynamic-system classification with known controls
+- Koopman-based models, including a residual Koopman variant
 
-- `configs/`: Method-organized config files.
-- `data/`: Input data (`.npy` trajectories).
-- `scripts/`: Train/eval scripts.
-- `src/common/`: Shared preprocessing and utilities.
-- `src/lstm/`: LSTM model, train, and eval modules.
-- `src/dynamic/`: Dynamic-system method.
-- `src/koopman/`: Koopman and residual Koopman methods.
-- `src/experimental/`: Experimental modules (for example Seq2Seq).
-- `src/eval_runner.py`: Unified evaluation entrypoint.
-- `test/`: Analysis and diagnostic scripts.
-- `tools/`: Visualization and comparison utilities.
-- `notes/`: Reports and figures.
+It also includes one experimental Seq2Seq branch for unknown-input settings, but that branch is not part of the stable main workflow.
 
-## 快速开始 / Quick Start
-Canonical usage is summarized in [TRAIN_EVAL_GUIDE.md](./TRAIN_EVAL_GUIDE.md).
+## Repository Layout
 
-### 1. LSTM 训练与评估 / LSTM Train & Eval
-训练 / Train:
+- `configs/`: Method-specific configuration files
+- `configs/lstm/`: LSTM configs
+- `configs/dynamic/`: Dynamic-system configs
+- `configs/koopman/`: Koopman configs
+- `configs/runtime/`: Runtime configs such as `accelerate`
+- `data/`: Input `.npy` trajectory files
+- `scripts/train/`: Stable training entry scripts
+- `scripts/eval/`: Stable evaluation entry scripts
+- `scripts/experimental/`: Experimental scripts
+- `src/common/`: Shared data loading, preprocessing, and utility code
+- `src/lstm/`: LSTM model, training, and evaluation
+- `src/dynamic/`: Dynamic-system method
+- `src/koopman/`: Koopman and residual Koopman methods
+- `src/experimental/`: Experimental modules
+- `src/eval_runner.py`: Unified evaluation entry point
+- `notes/`: Handover notes and report material
+- `tools/`: Plotting and comparison utilities
+- `test/`: Analysis scripts and saved diagnostic outputs
+
+## Environment
+
+Install dependencies with:
+
+```bash
+pip install -r requirements.txt
+```
+
+Recommended environment:
+
+- Python 3.9+
+- PyTorch
+- NumPy
+- pandas
+- scikit-learn
+- matplotlib
+- seaborn
+- tqdm
+- PyYAML
+- accelerate
+- wandb
+
+## Data Format and Preprocessing
+
+Data is expected under `data/` as `.npy` files. Each file stores a Python dictionary that includes at least:
+
+- `signals`
+- `ErrorType`
+
+The shared loader in `src/common/dataloader.py` currently interprets the channels as:
+
+- state channels: `signals[1000:, :-6]`
+- control channels: `signals[1000:, -6:-4]`
+
+The default preprocessing flow is:
+
+1. Drop the first 1000 time steps.
+2. Remove columns `[9, 21, 25, 39, 63]` from the state channels.
+3. Downsample by `sample_step`.
+4. Split each trajectory into non-overlapping windows.
+5. Apply the scaling pipeline `x -> standardize -> PCA -> standardize`.
+6. Standardize the control channels separately.
+
+For the default configs, the label space has six classes. In the current data release, these classes are used as a proxy for discrete fault locations.
+
+## Stable Workflows
+
+Run commands from the repository root:
+
+```bash
+cd /Users/shiqi/Documents/PhD/Code/Project3-power-grid/Combined-HIF-Detector
+```
+
+### LSTM
+
+Train:
+
 ```bash
 bash scripts/train/lstm.sh
 ```
-评估 / Eval:
+
+Evaluate:
+
 ```bash
 bash scripts/eval/lstm.sh
 ```
-或使用统一评估 / Or unified eval:
+
+Unified evaluation:
+
 ```bash
 python src/eval_runner.py \
   --method lstm \
-  --config configs/lstm/classifier.json \
+  --config_dir configs \
+  --config lstm/classifier.json \
   --model_path checkpoints/lstm_classifier/2000/best_model.pth \
   --save_csv evaluations/lstm_eval.csv
 ```
 
-### 2. 动态系统方法（已知输入）/ Dynamic System (Known Inputs)
+### Dynamic-System Method
+
+This method is evaluated in the known-control setting. It does not rely on a separately saved train checkpoint in the same way as the neural models; the system matrices are estimated during evaluation from the training split.
+
+Evaluate:
+
 ```bash
 bash scripts/eval/dynamic_known_control.sh
 ```
-或统一评估 / Or unified eval:
+
+Unified evaluation:
+
 ```bash
 python src/eval_runner.py \
   --method dynamic \
-  --config configs/lstm/classifier.json \
+  --config_dir configs \
+  --config lstm/classifier.json \
   --save_csv evaluations/dynamic_eval.csv
 ```
 
-### 3. Koopman 方法 / Koopman Methods
-训练 / Train:
+### Koopman
+
+Train:
+
 ```bash
 bash scripts/train/koopman_phi.sh
 ```
-残差 Koopman 训练 / Residual Koopman training:
-```bash
-bash scripts/train/koopman_residual.sh
-```
-评估 / Eval:
+
+Evaluate:
+
 ```bash
 bash scripts/eval/koopman_phi.sh
 ```
-残差 Koopman 评估 / Residual Koopman eval:
+
+Unified evaluation:
+
+```bash
+python src/eval_runner.py \
+  --method koopman \
+  --config_dir configs \
+  --config lstm/classifier.json \
+  --koopman_config koopman/phi.json \
+  --koopman_checkpoint checkpoints/koopman_phi/best_model.pt \
+  --save_csv evaluations/koopman_phi_eval.csv
+```
+
+### Residual Koopman
+
+Train:
+
+```bash
+bash scripts/train/koopman_residual.sh
+```
+
+Evaluate:
+
 ```bash
 bash scripts/eval/koopman_residual.sh
 ```
 
-### 4. Seq2Seq 训练（用于未知输入场景）/ Seq2Seq Training (Unknown Inputs)
+## Experimental Workflow
+
+The Seq2Seq branch remains experimental:
+
 ```bash
 bash scripts/experimental/seq2seq_simple.sh
 ```
 
-## 数据与预处理要点 / Data & Preprocessing Notes
-- 数据位于 `data/`，格式为 `.npy`，包含 `signals` 和 `ErrorType`。
-- 状态与输入通道在 `src/common/dataloader.py` 内拆分：
-  - 状态 `x = signals[:, :-6]`
-  - 控制 `u = signals[:, -6:-4]`
-- 默认流程包括：裁剪前 1000 步、采样、滑窗、标准化、PCA(2D)。
+Do not treat it as a stable baseline for the main comparison.
 
-- Data lives in `data/` as `.npy` files containing `signals` and `ErrorType`.
-- Channel split is defined in `src/common/dataloader.py`:
-  - State `x = signals[:, :-6]`
-  - Control `u = signals[:, -6:-4]`
-- Default pipeline: trim first 1000 steps, downsample, windowing, standardization, PCA(2D).
+## Evaluation Outputs
 
-## 结果说明（摘要）/ Results (Summary)
-更完整结果请见 `notes/` 下的 LaTeX 报告：
-- `notes/main.tex`：初步结果与已知/未知输入对比。
-- `notes/lstm_vs_dynamic.tex`：LSTM 与动态方法、Koopman 的对比分析。
+`src/eval_runner.py` is the main unified evaluation entry point for the stable methods. It supports:
 
-For full results, see LaTeX reports in `notes/`:
-- `notes/main.tex`: preliminary results with known/unknown inputs.
-- `notes/lstm_vs_dynamic.tex`: LSTM vs dynamic/Koopman comparisons.
+- overall metrics
+- top-k accuracy
+- window-length trend analysis
+- separate saved CSV outputs
 
-## 常见问题 / Common Issues
-- 部分旧脚本引用的评估文件不存在，见 `TRAIN_EVAL_GUIDE.md` 中的 stale scripts 说明。
-- 旧的 stale scripts 已从仓库移除。
-- 当前脚本目录已经按 `scripts/train`、`scripts/eval`、`scripts/experimental` 重组。
-- 脚本中的 checkpoint 路径可能需要按实际训练输出调整。
+The CLI now supports `--config_dir`, so configs can be passed as paths relative to `configs/`.
 
-- Use `src/eval_runner.py` as the main unified evaluation entry.
-- `eval_runner.py` default Koopman config path does not exist in this repo; pass one explicitly.
-- Checkpoint paths in scripts may need to be updated to match your outputs.
+## Important Notes
 
-## 依赖 / Dependencies
-- `python` 3.9+
-- `torch`, `numpy`, `scikit-learn`, `pandas`
-- `matplotlib`, `seaborn`, `tqdm`
-- `accelerate`, `wandb` (optional)
+- The core research goal is fault localization. The current six-class setup should be interpreted as a first-stage discrete-location proxy, not as the final problem definition.
+- `scripts/train/`, `scripts/eval/`, and `scripts/experimental/` are the maintained shell entry points.
+- `src/experimental/seq2seq_train.py` remains incomplete as a production-ready pipeline and should be treated as exploratory code.
+- Paths in the provided stable scripts are already aligned with the current repository structure, but checkpoint files must still exist at the expected locations.
 
----
-如需更详细的实验复现步骤或参数说明，可参考 `notes/project_handover.md`。
-For more detailed reproduction steps and parameters, see `notes/project_handover.md`.
+## Additional Documentation
+
+For more detail, see:
+
+- `TRAIN_EVAL_GUIDE.md`
+- `notes/project_handover.md`
+- the LaTeX handover material in `notes/`
